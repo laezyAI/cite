@@ -1530,7 +1530,7 @@ fn render_analytics_global(lines: &mut Vec<Line>, analytics: &AnalyticsState) {
     )));
     if let Some(ref global) = analytics.global {
         lines.push(Line::from(format!(
-            "  PROJECTS   : {}",
+            "  Projects   : {}",
             global.project_count
         )));
         lines.push(Line::from(format!(
