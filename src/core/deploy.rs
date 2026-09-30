@@ -984,14 +984,14 @@ podcasts:
         let news_one = server.mock(|w, t| {
             w.method(POST)
                 .path("/rest/v1/news")
-                .body_contains("Episode One");
+                .body_includes("Episode One");
             t.status(200).json_body(serde_json::json!([{ "id": 1 }]));
         });
         let news_two = server.mock(|w, t| {
             w.method(POST)
                 .path("/rest/v1/news")
-                .body_contains("Episode Two")
-                .body_contains("Hand-written summary.");
+                .body_includes("Episode Two")
+                .body_includes("Hand-written summary.");
             t.status(200).json_body(serde_json::json!([{ "id": 2 }]));
         });
         let news_patch = server.mock(|w, t| {
@@ -1023,27 +1023,27 @@ podcasts:
         let timeline_child = server.mock(|w, t| {
             w.method(POST)
                 .path("/rest/v1/timeline_news")
-                .body_contains("child_news_id");
+                .body_includes("child_news_id");
             t.status(200).json_body(serde_json::json!([{ "id": 2 }]));
         });
         let timeline_inline = server.mock(|w, t| {
             w.method(POST)
                 .path("/rest/v1/timeline_news")
-                .body_contains("title")
-                .body_contains("sort_order");
+                .body_includes("title")
+                .body_includes("sort_order");
             t.status(200).json_body(serde_json::json!([{ "id": 1 }]));
         });
         let storage_post = server.mock(|w, t| {
-            w.method(POST).path_contains("/storage/v1/object");
+            w.method(POST).path_includes("/storage/v1/object");
             t.status(200);
         });
         let artists_get = server.mock(|w, t| {
-            w.method(GET).path_contains("/rest/v1/artists");
+            w.method(GET).path_includes("/rest/v1/artists");
             t.status(200)
                 .json_body(serde_json::json!([{ "id": "11111111-1111-1111-1111-111111111111" }]));
         });
         let _get_fallback = server.mock(|w, t| {
-            w.method(GET).path_contains("/rest/v1/");
+            w.method(GET).path_includes("/rest/v1/");
             t.status(200).json_body(serde_json::json!([]));
         });
         let del_timeline = server.mock(|w, t| {
@@ -1055,11 +1055,11 @@ podcasts:
             t.status(200).json_body(serde_json::json!([]));
         });
         let storage_del = server.mock(|w, t| {
-            w.method(DELETE).path_contains("/storage/v1/object");
+            w.method(DELETE).path_includes("/storage/v1/object");
             t.status(200);
         });
         let _del_fallback = server.mock(|w, t| {
-            w.method(DELETE).path_contains("/rest/v1/");
+            w.method(DELETE).path_includes("/rest/v1/");
             t.status(200).json_body(serde_json::json!([]));
         });
 
@@ -1069,44 +1069,44 @@ podcasts:
             .expect("deploy should succeed");
 
         assert_eq!(
-            news_one.hits() + news_two.hits(),
+            news_one.calls() + news_two.calls(),
             2,
             "one news row per podcast"
         );
         assert_eq!(
-            child_news_get.hits(),
+            child_news_get.calls(),
             1,
             "remote child news id verified before linking"
         );
-        assert_eq!(news_patch.hits(), 1, "thumbnail patched after upload");
+        assert_eq!(news_patch.calls(), 1, "thumbnail patched after upload");
         assert_eq!(
-            categories_post.hits(),
+            categories_post.calls(),
             1,
             "unknown category created once and reused case-insensitively"
         );
         assert_eq!(
-            urls.hits(),
+            urls.calls(),
             3,
             "news sources plus fallback url for Episode Two plus citation event url"
         );
-        assert_eq!(domains.hits(), 2, "domain created via best-effort insert");
+        assert_eq!(domains.calls(), 2, "domain created via best-effort insert");
         assert_eq!(
-            podcasts.hits(),
+            podcasts.calls(),
             1,
             "podcast row with storage path + duration"
         );
         assert_eq!(
-            timeline_child.hits(),
+            timeline_child.calls(),
             2,
             "news id and episode file linked as timeline rows"
         );
         assert_eq!(
-            timeline_inline.hits(),
+            timeline_inline.calls(),
             3,
             "citation events and the inline event deployed as events"
         );
-        assert!(storage_post.hits() >= 1, "asset uploads");
-        assert!(artists_get.hits() >= 1, "artist existence checked");
+        assert!(storage_post.calls() >= 1, "asset uploads");
+        assert!(artists_get.calls() >= 1, "artist existence checked");
         let records_dir = deployments_dir(&ctx);
         assert_eq!(
             std::fs::read_dir(&records_dir).unwrap().count(),
@@ -1130,12 +1130,12 @@ podcasts:
         rollback(&ctx, &id).await.expect("rollback should succeed");
 
         assert_eq!(
-            del_timeline.hits(),
+            del_timeline.calls(),
             0,
             "timeline rows cascade with their news row"
         );
-        assert_eq!(del_news.hits(), 2, "news deleted");
-        assert!(storage_del.hits() >= 1, "storage object deleted");
+        assert_eq!(del_news.calls(), 2, "news deleted");
+        assert!(storage_del.calls() >= 1, "storage object deleted");
         assert_eq!(
             std::fs::read_dir(&records_dir).unwrap().count(),
             0,
@@ -1156,12 +1156,12 @@ podcasts:
                 .json_body(serde_json::json!([{ "id": 5, "name": "tech" }]));
         });
         server.mock(|w, t| {
-            w.method(GET).path_contains("/rest/v1/artists");
+            w.method(GET).path_includes("/rest/v1/artists");
             t.status(200)
                 .json_body(serde_json::json!([{ "id": "11111111-1111-1111-1111-111111111111" }]));
         });
         server.mock(|w, t| {
-            w.method(GET).path_contains("/rest/v1/");
+            w.method(GET).path_includes("/rest/v1/");
             t.status(200).json_body(serde_json::json!([]));
         });
     }
@@ -1210,7 +1210,7 @@ podcasts:
         let republished = server.mock(|w, t| {
             w.method(PATCH)
                 .path("/rest/v1/news")
-                .body_contains("published_at");
+                .body_includes("published_at");
             t.status(200);
         });
         let news_patch = server.mock(|w, t| {
@@ -1236,10 +1236,10 @@ podcasts:
         deploy(&db, &ctx, false).await.expect("first deploy");
         deploy(&db, &ctx, false).await.expect("second deploy");
 
-        assert_eq!(news_post.hits(), 1, "only Episode Two was ever inserted");
-        assert!(news_patch.hits() >= 3, "news rows updated in place");
-        assert_eq!(republished.hits(), 0, "published_at kept on update");
-        assert_eq!(timeline_reset.hits(), 3, "timeline rebuilt per update");
+        assert_eq!(news_post.calls(), 1, "only Episode Two was ever inserted");
+        assert!(news_patch.calls() >= 3, "news rows updated in place");
+        assert_eq!(republished.calls(), 0, "published_at kept on update");
+        assert_eq!(timeline_reset.calls(), 3, "timeline rebuilt per update");
 
         let mut updated: Vec<Vec<i64>> = deployment_records(&ctx)
             .into_iter()
@@ -1280,13 +1280,13 @@ podcasts:
         let news_post = server.mock(|w, t| {
             w.method(POST)
                 .path("/rest/v1/news")
-                .body_contains("Episode One");
+                .body_includes("Episode One");
             t.status(200).json_body(serde_json::json!([{ "id": 40 }]));
         });
         let news_post_two = server.mock(|w, t| {
             w.method(POST)
                 .path("/rest/v1/news")
-                .body_contains("Episode Two");
+                .body_includes("Episode Two");
             t.status(200).json_body(serde_json::json!([{ "id": 41 }]));
         });
         server.mock(|w, t| {
@@ -1306,8 +1306,8 @@ podcasts:
         lock.save(&ctx.root).unwrap();
 
         deploy(&db, &ctx, false).await.expect("deploy");
-        assert_eq!(news_post.hits() + news_post_two.hits(), 2);
-        assert_eq!(title_lookup.hits(), 0, "cite.lock is authoritative");
+        assert_eq!(news_post.calls() + news_post_two.calls(), 2);
+        assert_eq!(title_lookup.calls(), 0, "cite.lock is authoritative");
 
         let lock = Lockfile::load(&ctx.root).unwrap();
         assert_eq!(
@@ -1335,7 +1335,7 @@ podcasts:
             t.status(200).json_body(serde_json::json!([]));
         });
         server.mock(|w, t| {
-            w.method(POST).path_contains("/storage/v1/object");
+            w.method(POST).path_includes("/storage/v1/object");
             t.status(200);
         });
         server.mock(|w, t| {
@@ -1373,13 +1373,13 @@ podcasts:
         let err = deploy(&db, &ctx, false).await.unwrap_err();
         assert!(err.to_string().contains("has no category"), "{err}");
         assert!(err.to_string().contains("tech"), "lists available: {err}");
-        assert_eq!(inserts.hits(), 0, "nothing written");
+        assert_eq!(inserts.calls(), 0, "nothing written");
     }
     #[tokio::test]
     async fn test_dry_run_previews_from_lockfile_without_requests() {
         let server = MockServer::start();
         let any = server.mock(|w, t| {
-            w.path_contains("/");
+            w.path_includes("/");
             t.status(500);
         });
         let (_dir, ctx, db) = setup(&server.base_url()).await;
@@ -1389,7 +1389,7 @@ podcasts:
 
         let msg = deploy(&db, &ctx, true).await.expect("dry run");
         assert_eq!(msg, "Dry run: 2 podcast(s), 1 update(s), 1 new");
-        assert_eq!(any.hits(), 0, "dry run never contacts Supabase");
+        assert_eq!(any.calls(), 0, "dry run never contacts Supabase");
         assert!(!deployments_dir(&ctx).exists(), "nothing recorded");
     }
 
@@ -1397,7 +1397,7 @@ podcasts:
     async fn test_invalid_metadata_blocks_deploy_before_any_request() {
         let server = MockServer::start();
         let any = server.mock(|w, t| {
-            w.path_contains("/");
+            w.path_includes("/");
             t.status(500);
         });
         let (dir, _, db) = setup(&server.base_url()).await;
@@ -1412,7 +1412,7 @@ podcasts:
 
         let err = deploy(&db, &ctx, false).await.unwrap_err().to_string();
         assert!(err.contains("summary has 51 words"), "{err}");
-        assert_eq!(any.hits(), 0, "nothing sent");
+        assert_eq!(any.calls(), 0, "nothing sent");
     }
 
     #[tokio::test]
@@ -1451,7 +1451,7 @@ podcasts:
 
         let err = rollback(&ctx, "d1").await.unwrap_err().to_string();
         assert!(err.contains("went to https://other.supabase.co"), "{err}");
-        assert_eq!(deletes.hits(), 0, "nothing deleted");
+        assert_eq!(deletes.calls(), 0, "nothing deleted");
         assert!(rollback(&ctx, "unknown").await.is_err());
     }
 

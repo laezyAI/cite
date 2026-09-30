@@ -31,7 +31,6 @@ const ERROR: Color = Color::Red;
 const READY: Color = Color::Green;
 const MUTED: Color = Color::DarkGray;
 const ON_ACCENT: Color = Color::Black;
-
 const MAX_LOG_LINES: usize = 5_000;
 
 struct TerminalGuard;
@@ -870,17 +869,24 @@ async fn restore_archived(
     scaffold::restore_project(&db, project_id, target).await
 }
 
-fn block(title: impl Into<String>, focused: bool) -> Block<'static> {
-    let border_style = if focused {
-        Style::new().fg(ACCENT)
-    } else {
-        Style::new()
-    };
-    Block::default()
+fn panel_frame(frame: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
+    let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(border_style)
-        .title(title.into())
+        .border_style(if focused {
+            Style::new().fg(ACCENT)
+        } else {
+            Style::new()
+        })
+        .title(title)
+        .title_style(if focused {
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
 
 fn color_log_line(l: &str) -> Line<'static> {
@@ -1002,14 +1008,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
     let (left_text, style) = if app.busy {
         let cmd = &CMDS[app.cmds_state.selected().unwrap_or(0)];
         (
-            format!(" Executing: {} on {} ", cmd.label, app.cwd.display()),
-            Style::new()
-                .fg(ON_ACCENT)
-                .bg(WARN)
-                .add_modifier(Modifier::BOLD),
+            format!(" EXECUTING: {} on {} ", cmd.label, app.cwd.display()),
+            Style::new().fg(WARN).add_modifier(Modifier::BOLD),
         )
     } else {
-        (" Ready ".to_string(), Style::new().fg(ON_ACCENT).bg(READY))
+        (" READY ".to_string(), Style::new().fg(READY))
     };
     let version = Span::styled(
         format!("v{}", env!("CARGO_PKG_VERSION")),
@@ -1065,9 +1068,7 @@ fn render_categorized_project_list(frame: &mut Frame, area: Rect, app: &mut AppS
         })
         .collect();
 
-    let block_widget = block(" Projects ", is_focused);
-    let inner_area = block_widget.inner(area);
-    frame.render_widget(block_widget, area);
+    let inner_area = panel_frame(frame, area, " PROJECTS ", is_focused);
 
     let list = List::new(items).highlight_style(
         Style::new()
@@ -1098,9 +1099,7 @@ fn render_categorized_project_list(frame: &mut Frame, area: Rect, app: &mut AppS
 
 fn render_commands_pane(frame: &mut Frame, area: Rect, app: &mut AppState) {
     let is_focused = matches!(app.focus, Focus::Commands);
-    let block_widget = block(" Commands ", is_focused);
-    let inner = block_widget.inner(area);
-    frame.render_widget(block_widget, area);
+    let inner = panel_frame(frame, area, " COMMANDS ", is_focused);
 
     let [tabs_area, doc_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
@@ -1168,10 +1167,7 @@ fn render_log(frame: &mut Frame, area: Rect, app: &AppState) {
         .iter()
         .map(|l| color_log_line(l))
         .collect();
-    let block_widget = block(" Logs ", is_focused);
-    let inner_area = block_widget.inner(area);
-
-    frame.render_widget(block_widget, area);
+    let inner_area = panel_frame(frame, area, " LOGS ", is_focused);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         inner_area,
@@ -1193,10 +1189,10 @@ fn render_log(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn pane_label(focus: Focus) -> &'static str {
     match focus {
-        Focus::Projects => " Projects ",
-        Focus::Commands => " Commands ",
-        Focus::Analytics => " Analytics ",
-        Focus::Logs => " Logs ",
+        Focus::Projects => " PROJECTS ",
+        Focus::Commands => " COMMANDS ",
+        Focus::Analytics => " ANALYTICS ",
+        Focus::Logs => " LOGS ",
     }
 }
 
@@ -1414,9 +1410,7 @@ fn render_analytics_content(frame: &mut Frame, area: Rect, app: &AppState) {
     }
 
     let is_focused = matches!(app.focus, Focus::Analytics);
-    let block_widget = block(" Analytics ", is_focused);
-    let inner_area = block_widget.inner(area);
-    frame.render_widget(block_widget, area);
+    let inner_area = panel_frame(frame, area, " ANALYTICS ", is_focused);
 
     let visible_lines = inner_area.height as usize;
     let total_lines = lines.len();
@@ -1536,7 +1530,7 @@ fn render_analytics_global(lines: &mut Vec<Line>, analytics: &AnalyticsState) {
     )));
     if let Some(ref global) = analytics.global {
         lines.push(Line::from(format!(
-            "  Projects   : {}",
+            "  PROJECTS   : {}",
             global.project_count
         )));
         lines.push(Line::from(format!(

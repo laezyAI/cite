@@ -265,7 +265,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert_eq!(attempts.hits(), UPLOAD_ATTEMPTS as usize);
+        assert_eq!(attempts.calls(), UPLOAD_ATTEMPTS as usize);
         assert!(
             err.contains("after 3 attempts") && err.contains("busy"),
             "{err}"
