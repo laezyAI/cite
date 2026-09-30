@@ -1,8 +1,9 @@
+//! Content hashing and the incremental build cache (SHA-256 of sources plus compiler version).
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::core::CiteError;
@@ -38,42 +39,6 @@ impl BuildCache {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UuidCache {
-    pub mapping: HashMap<String, String>,
-}
-
-impl UuidCache {
-    pub fn load(root: &Path) -> Self {
-        let path = root.join(".cite").join("cache").join("uuid_map.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| Self {
-                mapping: HashMap::new(),
-            })
-    }
-
-    pub fn save(&self, root: &Path) {
-        let dir = root.join(".cite").join("cache");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("uuid_map.json");
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
-        }
-    }
-
-    pub fn get_or_create(&mut self, key: &str) -> String {
-        if let Some(id) = self.mapping.get(key) {
-            return id.clone();
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        self.mapping.insert(key.to_string(), id.clone());
-        id
-    }
-}
-
-/// Hash every existing file in `files`, off the async runtime.
 pub async fn hash_files(files: Vec<PathBuf>) -> Result<HashMap<String, String>, CiteError> {
     tokio::task::spawn_blocking(move || {
         let mut hashes = HashMap::with_capacity(files.len());
@@ -89,12 +54,15 @@ pub async fn hash_files(files: Vec<PathBuf>) -> Result<HashMap<String, String>, 
     .map_err(|e| CiteError::Config(format!("Hashing task failed: {e}")))?
 }
 
-/// Streaming SHA-256 of a file as lowercase hex; never loads the whole file into memory.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher)?;
     Ok(to_hex(&hasher.finalize()))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    to_hex(&Sha256::digest(bytes))
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -141,6 +109,13 @@ mod tests {
     }
 
     #[test]
+    fn test_changed_since_removed_file() {
+        let hashes = HashMap::from([("a.md".to_string(), "abc".to_string())]);
+        let cache = BuildCache::new(0.0, hashes);
+        assert_eq!(cache.changed_since(&HashMap::new()), vec!["a.md"]);
+    }
+
+    #[test]
     fn test_sha256_file_known_value() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("hello.txt");
@@ -161,16 +136,5 @@ mod tests {
             .unwrap();
         assert_eq!(hashes.len(), 1);
         assert!(hashes.contains_key(present.to_string_lossy().as_ref()));
-    }
-
-    #[test]
-    fn test_uuid_cache_persistence() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cache = UuidCache::load(dir.path());
-        let id = cache.get_or_create("test-key");
-        assert!(!id.is_empty());
-        cache.save(dir.path());
-        let loaded = UuidCache::load(dir.path());
-        assert_eq!(loaded.mapping.get("test-key"), Some(&id));
     }
 }

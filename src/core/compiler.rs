@@ -1,15 +1,19 @@
+//! Deterministic build of sources into `build/content.json` with an incremental hash cache (local analytics writes are best-effort).
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
+use uuid::Uuid;
 
 use crate::core::CiteError;
-use crate::core::cache::{UuidCache, hash_files};
-use crate::core::db::DbManager;
+use crate::core::bibtex;
+use crate::core::cache::hash_files;
+use crate::core::db::{BuildRecord, DbManager};
+use crate::core::markdown::word_count;
 use crate::core::media::{AudioMeta, ImageMeta, extract_audio, extract_image};
 use crate::core::metadata::{Podcast, TimelineEntry, TimelineItem};
-use crate::core::project::{BuildRecord, ProjectContext};
+use crate::core::project::ProjectContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentBundle {
@@ -89,7 +93,7 @@ pub async fn compile(
     let project_id = ctx.project_id();
     let build = &ctx.manifest.build;
 
-    let current_hashes = hash_files(ctx.content_files()).await?;
+    let current_hashes = hash_files(ctx.source_files()).await?;
 
     let cache = if force || !build.incremental {
         None
@@ -107,13 +111,10 @@ pub async fn compile(
     }
     let was_incremental = cache.is_some();
 
-    let mut uuid_cache = UuidCache::load(&ctx.root);
-    let bundle = build_bundle(ctx, &project_id, &mut uuid_cache).await?;
-    uuid_cache.save(&ctx.root);
+    let bundle = build_bundle(ctx, &project_id).await?;
 
-    let build_dir = ctx.build_dir();
-    let artifact = build_dir.join("content.json");
-    tokio::fs::create_dir_all(&build_dir).await?;
+    let artifact = ctx.bundle_path();
+    tokio::fs::create_dir_all(ctx.build_dir()).await?;
     tokio::fs::write(&artifact, serde_json::to_vec_pretty(&bundle)?).await?;
 
     let duration_ms = start.elapsed().as_millis() as i64;
@@ -129,7 +130,6 @@ pub async fn compile(
         .map(|t| t.entries.len() as i64)
         .sum();
 
-    // Local analytics are best-effort: a DB hiccup must not fail an otherwise good build.
     let _ = db.save_cache(&project_id, &current_hashes).await;
     let _ = db.sync_project(ctx, &bundle).await;
     let _ = db
@@ -156,20 +156,17 @@ pub async fn compile(
     })
 }
 
-pub fn word_count(content: &str) -> i64 {
-    content.split_whitespace().count() as i64
+fn stable_id(project_id: &str, kind: &str, file: &str) -> String {
+    let key = format!("cite:{project_id}:{kind}:{file}");
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
 }
 
-async fn build_bundle(
-    ctx: &ProjectContext,
-    project_id: &str,
-    uuid_cache: &mut UuidCache,
-) -> Result<ContentBundle, CiteError> {
+async fn build_bundle(ctx: &ProjectContext, project_id: &str) -> Result<ContentBundle, CiteError> {
     let mut podcasts = Vec::with_capacity(ctx.metadata.podcasts.len());
     let mut timelines = Vec::new();
 
     for p in &ctx.metadata.podcasts {
-        let id = uuid_cache.get_or_create(&format!("podcast:{project_id}:{}", p.file));
+        let id = stable_id(project_id, "podcast", &p.file);
         let content = read_optional(&ctx.root.join(&p.file), !p.file.is_empty()).await?;
 
         let audio_path = p.audio.as_ref().map(|a| ctx.root.join(a));
@@ -194,11 +191,11 @@ async fn build_bundle(
             let Some(bib) = read_optional(&ctx.root.join(citation), true).await? else {
                 continue;
             };
-            let mut entries = parse_bibtex(&bib);
+            let mut entries = bibtex::parse(&bib);
             if entries.is_empty() {
                 continue;
             }
-            let tl_id = uuid_cache.get_or_create(&format!("timeline:{project_id}:{citation}"));
+            let tl_id = stable_id(project_id, "timeline", citation);
             for (idx, entry) in entries.iter_mut().enumerate() {
                 entry.id = format!("{tl_id}-{idx}");
             }
@@ -228,7 +225,6 @@ async fn build_bundle(
     })
 }
 
-/// Read a UTF-8 file if `enabled` and it exists; a missing file is not an error.
 async fn read_optional(path: &Path, enabled: bool) -> Result<Option<String>, CiteError> {
     if !enabled || !path.is_file() {
         return Ok(None);
@@ -236,310 +232,9 @@ async fn read_optional(path: &Path, enabled: bool) -> Result<Option<String>, Cit
     Ok(Some(tokio::fs::read_to_string(path).await?))
 }
 
-pub fn parse_bibtex(content: &str) -> Vec<TimelineEntry> {
-    let mut entries = Vec::new();
-    let mut pos = 0;
-    let bytes = content.as_bytes();
-
-    while pos < bytes.len() {
-        if bytes[pos] != b'@' {
-            pos += 1;
-            continue;
-        }
-        pos += 1;
-
-        let open = match content[pos..].find('{') {
-            Some(i) => pos + i,
-            None => break,
-        };
-        let entry_type = content[pos..open].trim().to_lowercase();
-        if matches!(
-            entry_type.as_str(),
-            "comment" | "string" | "preamble" | "xdata"
-        ) {
-            let mut depth = 1;
-            for (offset, &b) in bytes[open + 1..].iter().enumerate() {
-                match b {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            pos = open + 1 + offset + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        pos = open + 1;
-
-        let mut depth = 1;
-        let mut close = None;
-        for (offset, &b) in bytes[pos..].iter().enumerate() {
-            match b {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(pos + offset);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let end = match close {
-            Some(i) => i,
-            None => break,
-        };
-
-        let body = &content[pos..end];
-        pos = end + 1;
-
-        let title = extract_bib_field(body, "title").unwrap_or_default();
-        let author = extract_bib_field(body, "author").unwrap_or_default();
-        let year = extract_bib_field(body, "year");
-        let month = extract_bib_field(body, "month");
-        let summary = extract_bib_field(body, "abstract")
-            .or_else(|| extract_bib_field(body, "note"))
-            .unwrap_or_default();
-        let url = extract_bib_field(body, "url")
-            .or_else(|| extract_bib_field(body, "doi"))
-            .unwrap_or_default();
-        let link = extract_bib_field(body, "link").filter(|l| !l.trim().is_empty());
-        entries.push(TimelineEntry {
-            // Stable ids are assigned by the compiler once the owning timeline is known.
-            id: String::new(),
-            date: Some(format_bib_date(&year, &month)),
-            title: format_title(&title, &author),
-            summary: Some(summary),
-            url: Some(url),
-            link,
-        });
-    }
-
-    entries
-}
-
-fn extract_bib_field(body: &str, field: &str) -> Option<String> {
-    let bytes = body.as_bytes();
-    let mut pos = 0;
-
-    loop {
-        let fpos = body[pos..].find(field)?;
-        let abs_pos = pos + fpos;
-
-        if abs_pos > 0 {
-            let prev = bytes[abs_pos - 1];
-            if prev != b'\n' && prev != b' ' && prev != b'\t' {
-                pos = abs_pos + 1;
-                continue;
-            }
-        }
-
-        let after_field = &body[abs_pos + field.len()..];
-        let trimmed = after_field.trim_start();
-        if !trimmed.starts_with('=') {
-            pos = abs_pos + 1;
-            continue;
-        }
-
-        let after_eq = trimmed[1..].trim();
-        let val: &str = if let Some(inner) = after_eq.strip_prefix('{') {
-            let mut depth = 1usize;
-            let mut end = None;
-            for (i, c) in inner.char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(i);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            end.map(|i| &inner[..i])?
-        } else if let Some(quoted) = after_eq.strip_prefix('"') {
-            let close = quoted.find('"')?;
-            &quoted[..close]
-        } else {
-            let delim = after_eq.find([',', '}', '\n'])?;
-            after_eq[..delim].trim()
-        };
-
-        let cleaned = val.trim().trim_end_matches(',');
-        return Some(cleaned.to_string());
-    }
-}
-
-fn format_bib_date(year: &Option<String>, month: &Option<String>) -> String {
-    let y = year.as_deref().unwrap_or("");
-    let m = month.as_deref().and_then(|m| {
-        let m = m.trim().to_lowercase();
-        Some(match m.as_str() {
-            "jan" | "january" => "01",
-            "feb" | "february" => "02",
-            "mar" | "march" => "03",
-            "apr" | "april" => "04",
-            "may" => "05",
-            "jun" | "june" => "06",
-            "jul" | "july" => "07",
-            "aug" | "august" => "08",
-            "sep" | "september" => "09",
-            "oct" | "october" => "10",
-            "nov" | "november" => "11",
-            "dec" | "december" => "12",
-            _ => return None,
-        })
-    });
-
-    match (y, m) {
-        (y, Some(m)) if !y.is_empty() => format!("{y}-{m}"),
-        (y, _) if !y.is_empty() => y.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn format_title(title: &str, author: &str) -> String {
-    if title.is_empty() {
-        return author.to_string();
-    }
-    let cleaned: String = title.chars().filter(|&c| c != '{' && c != '}').collect();
-    if author.is_empty() {
-        cleaned
-    } else {
-        format!("{} — {}", cleaned, author)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_bibtex_extracts_timeline_entries() {
-        let bib = r#"
-@article{einstein1935,
-  title = {Can Quantum-Mechanical Description of Physical Reality Be Considered Complete?},
-  author = {Einstein, A. and Podolsky, B. and Rosen, N.},
-  year = {1935},
-  month = may,
-  abstract = {A description of physical reality},
-  doi = {10.1038/35057060},
-}
-"#;
-        let entries = parse_bibtex(bib);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].date.as_deref(), Some("1935-05"));
-        assert!(entries[0].title.contains("Quantum-Mechanical"));
-        assert_eq!(entries[0].url.as_deref(), Some("10.1038/35057060"));
-    }
-
-    #[test]
-    fn test_parse_bibtex_empty() {
-        assert!(parse_bibtex("").is_empty());
-    }
-
-    #[test]
-    fn test_parse_bibtex_multiple_entries() {
-        let bib = r#"
-@article{first,
-  title = {First Paper},
-  year = {2020},
-}
-@article{second,
-  title = {Second Paper},
-  year = {2021},
-}
-"#;
-        assert_eq!(parse_bibtex(bib).len(), 2);
-    }
-
-    #[test]
-    fn test_format_title_with_author() {
-        assert_eq!(
-            format_title("My Paper", "Smith, J."),
-            "My Paper — Smith, J."
-        );
-    }
-
-    #[test]
-    fn test_format_title_without_author() {
-        assert_eq!(format_title("My Paper", ""), "My Paper");
-    }
-
-    #[test]
-    fn test_format_title_without_title() {
-        assert_eq!(format_title("", "Smith, J."), "Smith, J.");
-    }
-
-    #[test]
-    fn test_format_title_trims_surrounding_braces() {
-        assert_eq!(format_title("{E}nsemble {M}ethods", ""), "Ensemble Methods");
-    }
-
-    #[test]
-    fn test_format_bib_date_year_only() {
-        let year = Some("2023".to_string());
-        let month = None;
-        assert_eq!(format_bib_date(&year, &month), "2023");
-    }
-
-    #[test]
-    fn test_format_bib_date_year_month() {
-        let year = Some("2023".to_string());
-        let month = Some("may".to_string());
-        assert_eq!(format_bib_date(&year, &month), "2023-05");
-    }
-
-    #[test]
-    fn test_format_bib_date_full_month() {
-        let year = Some("2023".to_string());
-        let month = Some("January".to_string());
-        assert_eq!(format_bib_date(&year, &month), "2023-01");
-    }
-
-    #[test]
-    fn test_format_bib_date_empty() {
-        let year = None;
-        let month = None;
-        assert_eq!(format_bib_date(&year, &month), "");
-    }
-
-    #[test]
-    fn test_format_bib_date_invalid_month() {
-        let year = Some("2023".to_string());
-        let month = Some("invalid".to_string());
-        assert_eq!(format_bib_date(&year, &month), "2023");
-    }
-
-    #[test]
-    fn test_parse_bibtex_skips_non_entries() {
-        let bib = r#"
-@comment{ this should be ignored }
-@string{ key = "value" }
-@preamble{ "x" }
-@article{real,
-  title = {Real Entry},
-  year = {2023},
-}
-"#;
-        let entries = parse_bibtex(bib);
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].title.contains("Real Entry"));
-    }
-
-    #[test]
-    fn test_word_count() {
-        assert_eq!(word_count("one two  three\n"), 3);
-        assert_eq!(word_count(""), 0);
-    }
 
     fn write_project(dir: &Path) -> ProjectContext {
         std::fs::write(
@@ -562,6 +257,18 @@ mod tests {
         ProjectContext::load(dir).unwrap()
     }
 
+    #[test]
+    fn test_stable_id_depends_only_on_inputs() {
+        assert_eq!(
+            stable_id("p", "podcast", "content/a.md"),
+            stable_id("p", "podcast", "content/a.md")
+        );
+        assert_ne!(
+            stable_id("p", "podcast", "content/a.md"),
+            stable_id("p", "podcast", "content/b.md")
+        );
+    }
+
     #[tokio::test]
     async fn test_compile_syncs_timelines_to_owning_podcast() {
         let dir = tempfile::tempdir().unwrap();
@@ -579,7 +286,6 @@ mod tests {
             "no cache yet, so this is a full build"
         );
 
-        // Duplicate BibTeX titles must not collide in the local snapshot.
         let snapshot = db.get_restore_snapshot(&ctx.project_id()).await.unwrap();
         assert_eq!(snapshot.podcasts.len(), 1);
         assert_eq!(snapshot.timelines.len(), 2);
@@ -602,5 +308,29 @@ mod tests {
             panic!("changed content must recompile");
         };
         assert!(stats.was_incremental);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_edit_triggers_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = write_project(dir.path());
+        let db = DbManager::open_path(&dir.path().join("test.db"))
+            .await
+            .unwrap();
+        compile(&db, &ctx, false).await.unwrap();
+
+        std::fs::write(
+            dir.path().join("metadata.yml"),
+            "podcasts:\n  - title: Renamed\n    file: content/ep.md\n",
+        )
+        .unwrap();
+        let ctx = ProjectContext::load(dir.path()).unwrap();
+        assert!(
+            matches!(
+                compile(&db, &ctx, false).await.unwrap(),
+                CompileOutcome::Complete { .. }
+            ),
+            "a title change in metadata.yml must be rebuilt and redeployed"
+        );
     }
 }

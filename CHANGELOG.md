@@ -1,5 +1,12 @@
 # changelog
 
+## Unreleased
+- Redeploys update news in place via `cite.lock` (commit it/keep it safe).
+- Friendlier `metadata.yml`: inline timeline events, typos reported by line, flexible dates and links.
+- Login with hidden password prompt and auto-refreshed sessions.
+- Fixed private Markdown uploaded to the public bucket, broken timeline events, and edits not triggering a rebuild.
+- Fixed `cite login` artist creation being rejected by row-level security, and login using a different Supabase project than deploy.
+
 ## 0.1.0-beta.0
 - Package renamed from `cite-cli` to `cite` (binary, installers, and repo `laezyAI/cite`)
 - Fixed `upgrade`, archived-project restore, and staging dry-run writing to the local database

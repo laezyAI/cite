@@ -1,3 +1,4 @@
+//! Binary entry: parses CLI args, runs the matching command, or opens the TUI when no command is given.
 mod cli;
 mod core;
 mod tui;
@@ -6,7 +7,6 @@ use clap::Parser;
 use cli::Cli;
 use colored::Colorize;
 use std::io::Write;
-use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -50,8 +50,7 @@ async fn main() {
             })
             .init();
         info!("cite v{}", env!("CARGO_PKG_VERSION"));
-        let root = PathBuf::from(&cli.path);
-        if let Err(e) = tui::run_tui(log_rx, root).await {
+        if let Err(e) = tui::run_tui(log_rx, cli.path).await {
             eprintln!("{} {}", "error:".red().bold(), e);
             std::process::exit(1);
         }

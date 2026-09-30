@@ -1,37 +1,39 @@
+//! Core library: project loading, parsing, building, validating, deploying, and local state (home resolution and owner-only writes included).
+
+pub mod auth;
+pub mod bibtex;
 pub mod cache;
 pub mod compiler;
-pub mod credentials;
 pub mod db;
 pub mod deploy;
 pub mod doctor;
+pub mod error;
+pub mod install;
+pub mod lockfile;
 pub mod manifest;
+pub mod markdown;
 pub mod media;
 pub mod metadata;
 pub mod project;
 pub mod scaffold;
-pub mod uninstall;
-pub mod upgrade;
+pub mod supabase;
 
-pub mod report;
-pub use report::CiteError;
+pub use error::CiteError;
 
 use std::path::{Path, PathBuf};
 
-/// The user's home directory (`HOME`, falling back to `USERPROFILE` on Windows).
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
 }
 
-/// Global state directory: `~/.cite`.
 pub fn cite_home() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cite")
 }
 
-/// Write a file readable only by the current user (credentials, sessions).
 pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -46,7 +48,6 @@ pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        // `mode` only applies on creation; tighten files written by older versions too.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(contents)
     }

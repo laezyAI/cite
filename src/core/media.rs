@@ -1,3 +1,4 @@
+//! Audio and image inspection plus upload MIME types matching the Supabase buckets.
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,25 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
 use crate::core::CiteError;
+
+pub const AUDIO_FORMATS: &[&str] = &["mp3", "wav", "m4a", "aac"];
+pub const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024;
+pub const IMAGE_FORMATS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
+pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+pub fn mime_type(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/m4a",
+        "aac" => "audio/aac",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioMeta {
@@ -30,22 +50,18 @@ pub struct ImageMeta {
     pub sha256: String,
 }
 
-/// Full audio metadata, including a content hash (used in build bundles).
 pub fn extract_audio(path: &Path) -> Result<AudioMeta, CiteError> {
     read_audio_meta(path, true)
 }
 
-/// Audio metadata without hashing the file (cheap; `sha256` is left empty).
 pub fn inspect_audio(path: &Path) -> Result<AudioMeta, CiteError> {
     read_audio_meta(path, false)
 }
 
-/// Full image metadata, including a content hash (used in build bundles).
 pub fn extract_image(path: &Path) -> Result<ImageMeta, CiteError> {
     read_image_meta(path, true)
 }
 
-/// Image metadata from the header only (cheap; `sha256` is left empty).
 pub fn inspect_image(path: &Path) -> Result<ImageMeta, CiteError> {
     read_image_meta(path, false)
 }
@@ -96,7 +112,6 @@ fn read_audio_meta(path: &Path, with_hash: bool) -> Result<AudioMeta, CiteError>
     })
 }
 
-/// Read container headers only; returns `None` for unreadable or non-audio files.
 fn probe_audio(path: &Path, ext: &str) -> Option<AudioProbe> {
     let file = std::fs::File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -193,26 +208,76 @@ mod tests {
         );
     }
 
+    fn wav(secs: u32, rate: u32) -> Vec<u8> {
+        let data_len = secs * rate * 2;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(out.len() + data_len as usize, 0);
+        out
+    }
+
+    #[test]
+    fn test_audio_duration_and_format_are_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("ep.WAV");
+        std::fs::write(&f, wav(2, 8000)).unwrap();
+
+        let meta = extract_audio(&f).unwrap();
+        assert!(
+            (meta.duration_secs - 2.0).abs() < 0.01,
+            "{}",
+            meta.duration_secs
+        );
+        assert_eq!(meta.format, "wav");
+        assert_eq!(meta.sample_rate_hz, 8000);
+        assert_eq!(meta.channels, 1);
+        assert_eq!(meta.bitrate_kbps, 128);
+        assert!(!meta.sha256.is_empty());
+        assert!(
+            inspect_audio(&f).unwrap().sha256.is_empty(),
+            "inspect skips hashing"
+        );
+    }
+
+    #[test]
+    fn test_unreadable_audio_has_no_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("fake.mp3");
+        std::fs::write(&f, b"not audio").unwrap();
+        let meta = inspect_audio(&f).unwrap();
+        assert_eq!(meta.duration_secs, 0.0);
+        assert_eq!(meta.codec, "unknown");
+    }
+
+    #[test]
+    fn test_mime_type_matches_podcasts_bucket() {
+        assert_eq!(mime_type("MP3"), "audio/mpeg");
+        assert_eq!(mime_type("m4a"), "audio/m4a");
+        assert_eq!(mime_type("jpeg"), "image/jpeg");
+        assert_eq!(mime_type("xyz"), "application/octet-stream");
+    }
+
     #[test]
     fn test_extract_image_png() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("test.png");
         let min_png = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
-            0x00, 0x00, 0x00, 0x0D, // chunk length
-            0x49, 0x48, 0x44, 0x52, // IHDR chunk
-            0x00, 0x00, 0x00, 0x01, // width = 1
-            0x00, 0x00, 0x00, 0x01, // height = 1
-            0x08, 0x02, 0x00, 0x00,
-            0x00, // bit depth, color type, compression, filter, interlace
-            0x90, 0x77, 0x53, 0xDE, // CRC
-            0x00, 0x00, 0x00, 0x0A, // chunk length
-            0x49, 0x44, 0x41, 0x54, // IDAT chunk
-            0x78, 0x9C, 0x62, 0x62, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, // compressed data
-            0x4A, 0x2E, 0x2C, 0xE8, // CRC
-            0x00, 0x00, 0x00, 0x00, // chunk length
-            0x49, 0x45, 0x4E, 0x44, // IEND chunk
-            0xAE, 0x42, 0x60, 0x82, // CRC
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x62, 0x62, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x4A, 0x2E, 0x2C, 0xE8, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         std::fs::write(&f, &min_png).unwrap();
         let meta = extract_image(&f).unwrap();
@@ -227,7 +292,6 @@ mod tests {
     fn test_extract_image_jpeg() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("test.jpg");
-        // Minimal valid JPEG (SOI + EOI markers)
         let min_jpg = vec![
             0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
             0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
