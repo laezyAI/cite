@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -19,13 +18,10 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::core::CiteError;
-use crate::core::db::DbManager;
-use crate::core::manifest::{Manifest, ProjectConfig};
-use crate::core::metadata::{Metadata, Podcast};
-use crate::core::project::{
-    self, AllStats, ProjectContext, ProjectStats, RestoredTimeline, StoredBuild, StoredDeployment,
-    StoredTimeline,
+use crate::core::db::{
+    AllStats, DbManager, ProjectStats, StoredBuild, StoredDeployment, StoredPodcast, StoredTimeline,
 };
+use crate::core::project::{self, ProjectContext};
 use crate::core::{compiler, deploy, doctor, scaffold};
 
 const ACCENT: Color = Color::Cyan;
@@ -87,14 +83,14 @@ pub const CMDS: &[Cmd] = &[
     },
     Cmd {
         label: "deploy",
-        desc: "Upload bundle and sync Supabase backend",
-        args_hint: "[--dry-run] [--staging]",
+        desc: "Validate, build if needed, and publish episodes to Supabase",
+        args_hint: "[--dry-run]",
         needs_project: true,
         id: CommandId::Deploy,
     },
     Cmd {
         label: "rollback",
-        desc: "Roll back to a previous deployment",
+        desc: "Remove the news items and uploads a deployment created",
         args_hint: "<deployment id>",
         needs_project: true,
         id: CommandId::Rollback,
@@ -115,6 +111,14 @@ pub enum Focus {
     Logs,
 }
 
+/// Panels in `Tab` order.
+const FOCUS_ORDER: [Focus; 4] = [
+    Focus::Projects,
+    Focus::Commands,
+    Focus::Analytics,
+    Focus::Logs,
+];
+
 #[derive(Clone, PartialEq)]
 pub enum ProjectItemKind {
     LocalHeader,
@@ -132,7 +136,7 @@ pub struct ProjectItem {
 pub struct AnalyticsState {
     pub stats: Option<ProjectStats>,
     pub global: Option<AllStats>,
-    pub podcasts: Vec<project::StoredPodcast>,
+    pub podcasts: Vec<StoredPodcast>,
     pub timelines: Vec<StoredTimeline>,
     pub builds: Vec<StoredBuild>,
     pub deploys: Vec<StoredDeployment>,
@@ -349,15 +353,6 @@ impl AppState {
         None
     }
 
-    fn focus_order(&self) -> Vec<Focus> {
-        vec![
-            Focus::Projects,
-            Focus::Commands,
-            Focus::Analytics,
-            Focus::Logs,
-        ]
-    }
-
     fn filtered_commands(&self) -> Vec<usize> {
         let query = self.command_palette.query.to_lowercase();
         CMDS.iter()
@@ -509,13 +504,15 @@ impl AppState {
                 if self.busy {
                     return;
                 }
-                let order = self.focus_order();
-                let i = order.iter().position(|f| *f == self.focus).unwrap_or(0);
-                let n = order.len();
+                let i = FOCUS_ORDER
+                    .iter()
+                    .position(|f| *f == self.focus)
+                    .unwrap_or(0);
+                let n = FOCUS_ORDER.len();
                 self.focus = if key.code == KeyCode::Tab {
-                    order[(i + 1) % n]
+                    FOCUS_ORDER[(i + 1) % n]
                 } else {
-                    order[(i + n - 1) % n]
+                    FOCUS_ORDER[(i + n - 1) % n]
                 };
             }
             KeyCode::Up => match self.focus {
@@ -572,7 +569,7 @@ impl AppState {
                                     self.rebuild_project_items();
                                 }
                                 ProjectItemKind::LocalProject(_) => {
-                                    info!(">> Selected project ");
+                                    info!(">> Selected project");
                                     self.load_analytics_data().await;
                                 }
                                 ProjectItemKind::ArchivedProject(name) => {
@@ -663,7 +660,7 @@ impl AppState {
             match id {
                 CommandId::Init => exec_init(cwd, raw_args).await,
                 CommandId::Build => exec_build(root, raw_args).await,
-                CommandId::Doctor => exec_doctor(root, raw_args).await,
+                CommandId::Doctor => exec_doctor(root).await,
                 CommandId::Deploy => exec_deploy(root, raw_args).await,
                 CommandId::Rollback => exec_rollback(root, raw_args).await,
             }
@@ -683,14 +680,10 @@ impl AppState {
             .and_then(|r| r.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_default();
         match id {
-            CommandId::Deploy => {
-                let mode = if self.arg_input.split_whitespace().any(|w| w == "--staging") {
-                    "local (staging)"
-                } else {
-                    "Supabase"
-                };
-                format!("Deploy '{target}' to {mode}?")
+            CommandId::Deploy if self.arg_input.split_whitespace().any(|w| w == "--dry-run") => {
+                format!("Preview deploying '{target}'?")
             }
+            CommandId::Deploy => format!("Deploy '{target}' to Supabase?"),
             CommandId::Rollback => {
                 let id = self.arg_input.trim();
                 if id.is_empty() {
@@ -794,12 +787,14 @@ impl AppState {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 let target = self.cwd.join(&name);
                 match restore_archived(&target, &name, &self.db_projects).await {
-                    Ok((podcasts, timelines, warnings)) => {
+                    Ok(summary) => {
                         info!(
-                            "Restored project {name} at {} ({podcasts} podcast(s), {timelines} timeline event(s))",
-                            target.display()
+                            "Restored project {name} at {} ({} podcast(s), {} timeline event(s))",
+                            target.display(),
+                            summary.podcasts,
+                            summary.timeline_events
                         );
-                        for warning in warnings {
+                        for warning in summary.warnings {
                             warn!("{warning}");
                         }
                     }
@@ -867,153 +862,13 @@ async fn restore_archived(
     target: &Path,
     name: &str,
     db_projects: &[(String, String)],
-) -> Result<(usize, usize, Vec<String>), CiteError> {
+) -> Result<scaffold::RestoreSummary, CiteError> {
     let (_, project_id) = db_projects
         .iter()
         .find(|(n, _)| n == name)
         .ok_or_else(|| CiteError::Config(format!("No local record for '{name}'")))?;
-
     let db = DbManager::open().await?;
-    let snapshot = db.get_restore_snapshot(project_id).await?;
-
-    tokio::fs::create_dir_all(target).await?;
-    tokio::fs::create_dir_all(target.join("content")).await?;
-
-    let manifest = Manifest {
-        project: ProjectConfig {
-            name: snapshot.name.clone(),
-            language: snapshot.language.clone(),
-            metadata_file: snapshot.metadata_file.clone(),
-            artist_id: snapshot.artist_id.clone(),
-        },
-        ..Default::default()
-    };
-    tokio::fs::write(target.join("cite.toml"), toml::to_string_pretty(&manifest)?).await?;
-
-    let mut warnings = Vec::new();
-    let mut podcasts_meta = Vec::new();
-
-    for pod in &snapshot.podcasts {
-        if pod.file.is_empty() {
-            continue;
-        }
-        match &pod.content {
-            Some(content) => {
-                let path = target.join(&pod.file);
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                tokio::fs::write(path, content).await?;
-            }
-            None => warnings.push(format!("Content missing for '{}'; re-add it", pod.title)),
-        }
-        if let Some(audio) = &pod.audio {
-            warnings.push(format!("Re-add audio asset {audio}"));
-        }
-        if let Some(thumbnail) = &pod.thumbnail {
-            warnings.push(format!("Re-add thumbnail asset {thumbnail}"));
-        }
-        podcasts_meta.push(Podcast {
-            title: pod.title.clone(),
-            file: pod.file.clone(),
-            source_url: pod.source_url.clone(),
-            category: pod.category.clone(),
-            thumbnail: pod.thumbnail.clone(),
-            audio: pod.audio.clone(),
-            timeline: match &pod.citation_file {
-                Some(file) => vec![crate::core::metadata::TimelineItem::Citation(file.clone())],
-                None => Vec::new(),
-            },
-        });
-    }
-
-    let timelines_by_podcast: HashMap<&str, Vec<&RestoredTimeline>> = snapshot
-        .timelines
-        .iter()
-        .map(|tl| (tl.podcast_id.as_str(), tl))
-        .fold(HashMap::new(), |mut groups, (id, tl)| {
-            groups.entry(id).or_default().push(tl);
-            groups
-        });
-
-    for pod in &snapshot.podcasts {
-        let Some(cit) = pod.citation_file.as_deref().filter(|c| !c.is_empty()) else {
-            continue;
-        };
-        let entries = timelines_by_podcast
-            .get(pod.id.as_str())
-            .cloned()
-            .unwrap_or_default();
-        let path = target.join(cit);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(path, render_bibtex(&entries)).await?;
-    }
-
-    let metadata_file = snapshot.metadata_file.clone();
-    let metadata = Metadata {
-        podcasts: podcasts_meta,
-    };
-    tokio::fs::write(
-        target.join(metadata_file),
-        serde_yaml::to_string(&metadata)?,
-    )
-    .await?;
-
-    Ok((snapshot.podcasts.len(), snapshot.timelines.len(), warnings))
-}
-
-fn render_bibtex(entries: &[&RestoredTimeline]) -> String {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
-
-    let mut out = String::new();
-    for (i, entry) in entries.iter().enumerate() {
-        let year = entry
-            .date
-            .as_deref()
-            .and_then(|d| d.get(..4))
-            .unwrap_or("0000");
-        out.push_str(&format!("@misc{{restored{i},\n"));
-        out.push_str(&format!(
-            "  title = {{{}}},\n",
-            sanitize_bib_value(&entry.title)
-        ));
-        out.push_str(&format!("  year = {{{year}}},\n"));
-        if let Some(month) = entry
-            .date
-            .as_deref()
-            .and_then(|d| d.get(5..7))
-            .and_then(|m| m.parse::<usize>().ok())
-            .and_then(|m| MONTHS.get(m.saturating_sub(1)))
-        {
-            out.push_str(&format!("  month = {{{month}}},\n"));
-        }
-        if let Some(summary) = &entry.summary {
-            out.push_str(&format!(
-                "  abstract = {{{}}},\n",
-                sanitize_bib_value(summary)
-            ));
-        }
-        if let Some(url) = &entry.url {
-            out.push_str(&format!("  url = {{{url}}},\n"));
-        }
-        if let Some(link) = &entry.link {
-            out.push_str(&format!("  link = {{{link}}},\n"));
-        }
-        out.push_str("}\n\n");
-    }
-    out
-}
-
-fn sanitize_bib_value(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !matches!(c, '{' | '}'))
-        .map(|c| if c == '\n' { ' ' } else { c })
-        .collect()
+    scaffold::restore_project(&db, project_id, target).await
 }
 
 fn block(title: impl Into<String>, focused: bool) -> Block<'static> {
@@ -1175,26 +1030,19 @@ fn render_header(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &mut AppState) {
-    match app.mode {
-        TuiMode::Runner | TuiMode::CommandPalette => {
-            let [left, middle, right] = Layout::horizontal([
-                Constraint::Max(20),
-                Constraint::Fill(2),
-                Constraint::Fill(1),
-            ])
-            .areas(area);
+    let [left, middle, right] = Layout::horizontal([
+        Constraint::Max(20),
+        Constraint::Fill(2),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let [cmd_area, logs_area] =
+        Layout::vertical([Constraint::Max(8), Constraint::Min(3)]).areas(middle);
 
-            render_categorized_project_list(frame, left, app);
-
-            let [cmd_area, logs_area] =
-                Layout::vertical([Constraint::Max(8), Constraint::Min(3)]).areas(middle);
-
-            render_commands_pane(frame, cmd_area, app);
-            render_log(frame, logs_area, app);
-
-            render_analytics_content(frame, right, app);
-        }
-    }
+    render_categorized_project_list(frame, left, app);
+    render_commands_pane(frame, cmd_area, app);
+    render_log(frame, logs_area, app);
+    render_analytics_content(frame, right, app);
 }
 
 fn render_categorized_project_list(frame: &mut Frame, area: Rect, app: &mut AppState) {
@@ -1610,7 +1458,7 @@ fn push_section(lines: &mut Vec<Line>, title: &str, expanded: bool, rows: Vec<St
     }
 }
 
-fn podcast_rows(podcasts: &[project::StoredPodcast]) -> Vec<String> {
+fn podcast_rows(podcasts: &[StoredPodcast]) -> Vec<String> {
     podcasts
         .iter()
         .map(|p| {
@@ -1639,7 +1487,7 @@ fn timeline_rows(timelines: &[StoredTimeline]) -> Vec<String> {
                 .as_ref()
                 .map(|et| format!(" ({et})"))
                 .unwrap_or_default();
-            let linked = t.url.is_some() || t.link.is_some();
+            let linked = t.url.is_some();
             format!(
                 "{}  {}{}{}",
                 t.date.as_deref().unwrap_or("??"),
@@ -1835,19 +1683,14 @@ async fn exec_build(root: Option<PathBuf>, raw: String) {
     }
 }
 
-async fn exec_doctor(root: Option<PathBuf>, _raw: String) {
+async fn exec_doctor(root: Option<PathBuf>) {
     let Some((ctx, db)) = load_project_context(root).await else {
         return;
     };
-    match doctor::run(&db, &ctx).await {
-        Ok(o) => {
-            o.emit();
-            project::print_status(&db, &ctx).await;
-            if !o.has_errors() && !o.has_warnings() {
-                info!("Doctor check complete; no issues found");
-            }
-        }
-        Err(e) => error!("Doctor failed: {e}"),
+    let outcome = doctor::run(&db, &ctx).await;
+    outcome.emit();
+    if !outcome.has_errors() && !outcome.has_warnings() {
+        info!("Doctor check complete; no issues found");
     }
 }
 
@@ -1856,17 +1699,9 @@ async fn exec_deploy(root: Option<PathBuf>, raw: String) {
         return;
     };
     let dry_run = raw.split_whitespace().any(|w| w == "--dry-run");
-    let staging = raw.split_whitespace().any(|w| w == "--staging");
-    if staging {
-        match deploy::deploy_staging(&db, &ctx, dry_run).await {
-            Ok(msg) => info!("{msg}"),
-            Err(e) => error!("Staging deploy failed: {e}"),
-        }
-    } else {
-        match deploy::deploy(&db, &ctx, dry_run).await {
-            Ok(msg) => info!("{msg}"),
-            Err(e) => error!("Deploy failed: {e}"),
-        }
+    match deploy::deploy(&db, &ctx, dry_run).await {
+        Ok(msg) => info!("{msg}"),
+        Err(e) => error!("Deploy failed: {e}"),
     }
 }
 
@@ -1880,9 +1715,9 @@ async fn exec_rollback(root: Option<PathBuf>, raw: String) {
         error!("No project selected");
         return;
     };
-    let Ok(ctx) = ProjectContext::load(&root) else {
-        error!("Failed to load project");
-        return;
+    let ctx = match ProjectContext::load(&root) {
+        Ok(ctx) => ctx,
+        Err(e) => return error!("Failed to load project: {e}"),
     };
     match deploy::rollback(&ctx, id).await {
         Ok(msg) => info!("{msg}"),

@@ -36,11 +36,16 @@ impl Default for BuildConfig {
     }
 }
 
+/// The Supabase project a deploy writes to. The `staging_*` names are accepted
+/// for manifests written before they were renamed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct BackendConfig {
-    pub staging_url: Option<String>,
-    pub staging_service_key: Option<String>,
+    #[serde(alias = "staging_url")]
+    pub url: Option<String>,
+    /// Project API key: the anon key (with `cite login`) or the service role key.
+    #[serde(alias = "staging_service_key")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -95,8 +100,8 @@ compiler_version = 1.0
 incremental = false
 
 [backend]
-staging_url = "https://example.com"
-staging_service_key = ""
+url = "https://example.com"
+api_key = ""
 
 [compiler]
 enabled_extensions = ["tables"]
@@ -116,9 +121,20 @@ strict = true
         assert_eq!(m.build.compiler_version, 1.0);
         assert!(!m.build.incremental);
         assert_eq!(
-            m.backend.as_ref().unwrap().staging_url.as_deref(),
+            m.backend.as_ref().unwrap().url.as_deref(),
             Some("https://example.com")
         );
+    }
+
+    #[test]
+    fn test_deserialize_legacy_backend_keys() {
+        let m: Manifest = toml::from_str(
+            "[backend]\nstaging_url = \"https://x.co\"\nstaging_service_key = \"k\"\n",
+        )
+        .unwrap();
+        let backend = m.backend.unwrap();
+        assert_eq!(backend.url.as_deref(), Some("https://x.co"));
+        assert_eq!(backend.api_key.as_deref(), Some("k"));
     }
 
     #[test]

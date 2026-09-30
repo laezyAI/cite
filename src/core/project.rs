@@ -1,133 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::CiteError;
+use crate::core::db::DbManager;
 use crate::core::manifest::Manifest;
 use crate::core::metadata::Metadata;
-use tracing::info;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BuildRecord {
-    pub project_id: String,
-    pub compiler_version: f64,
-    pub podcast_count: i64,
-    pub timeline_count: i64,
-    pub total_words: i64,
-    pub duration_ms: i64,
-    pub was_incremental: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DeployReport {
-    pub project_id: String,
-    pub deployment_id: String,
-    pub storage_path: String,
-    pub news_count: i64,
-    pub timeline_count: i64,
-    pub asset_count: i64,
-    pub success: bool,
-    pub dry_run: bool,
-}
-
-/// A podcast record from the DB (with content)
-#[derive(Debug, Clone)]
-pub struct StoredPodcast {
-    pub title: String,
-    pub word_count: i64,
-    pub category: String,
-    pub file: String,
-    pub has_audio: bool,
-    pub has_thumbnail: bool,
-}
-
-/// A timeline entry from the DB
-#[derive(Debug, Clone)]
-pub struct StoredTimeline {
-    pub date: Option<String>,
-    pub title: String,
-    pub url: Option<String>,
-    pub entry_type: Option<String>,
-    pub link: Option<String>,
-}
-
-/// A deployment record from the DB
-#[derive(Debug, Clone)]
-pub struct StoredDeployment {
-    pub deployment_id: String,
-    pub deployed_at: String,
-    pub success: bool,
-    pub news_count: i64,
-    pub asset_count: i64,
-}
-
-/// A build record from the DB
-#[derive(Debug, Clone)]
-pub struct StoredBuild {
-    pub podcast_count: i64,
-    pub timeline_count: i64,
-    pub total_words: i64,
-    pub duration_ms: i64,
-    pub was_incremental: bool,
-    pub built_at: String,
-}
-
-/// Per-project analytics from the DB
-#[derive(Debug, Clone)]
-pub struct ProjectStats {
-    pub podcast_count: i64,
-    pub timeline_count: i64,
-    pub total_words: i64,
-    pub build_count: i64,
-    pub last_built: Option<String>,
-    pub deployment_count: i64,
-    pub last_deployed: Option<String>,
-}
-
-/// Cross-project analytics from the DB
-#[derive(Debug, Clone)]
-pub struct AllStats {
-    pub project_count: i64,
-    pub total_podcasts: i64,
-    pub total_timelines: i64,
-    pub total_words: i64,
-    pub total_builds: i64,
-}
-
-/// A podcast row with everything needed to restore project files
-#[derive(Debug, Clone)]
-pub struct RestoredPodcast {
-    pub id: String,
-    pub title: String,
-    pub file: String,
-    pub source_url: Option<String>,
-    pub category: Option<String>,
-    pub thumbnail: Option<String>,
-    pub audio: Option<String>,
-    pub citation_file: Option<String>,
-    pub content: Option<String>,
-}
-
-/// A timeline row with its owning timeline group
-#[derive(Debug, Clone)]
-pub struct RestoredTimeline {
-    pub podcast_id: String,
-    pub date: Option<String>,
-    pub title: String,
-    pub summary: Option<String>,
-    pub url: Option<String>,
-    pub link: Option<String>,
-}
-
-/// Project-level data for restoring an archived project
-#[derive(Debug, Clone)]
-pub struct RestoredProject {
-    pub name: String,
-    pub language: String,
-    pub artist_id: String,
-    pub metadata_file: String,
-    pub podcasts: Vec<RestoredPodcast>,
-    pub timelines: Vec<RestoredTimeline>,
-}
-
+/// A loaded project: its root directory, `cite.toml`, and metadata file.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
     pub root: PathBuf,
@@ -149,12 +27,14 @@ impl ProjectContext {
             )));
         }
         let toml_str = std::fs::read_to_string(&manifest_path)?;
-        let manifest: Manifest = toml::from_str(&toml_str)?;
+        let manifest: Manifest =
+            toml::from_str(&toml_str).map_err(|e| CiteError::Parse(format!("cite.toml: {e}")))?;
 
-        let meta_path = root.join(&manifest.project.metadata_file);
+        let meta_file = &manifest.project.metadata_file;
+        let meta_path = root.join(meta_file);
         let metadata = if meta_path.exists() {
             let yaml_str = std::fs::read_to_string(&meta_path)?;
-            serde_yaml::from_str(&yaml_str)?
+            Metadata::parse(&yaml_str).map_err(|e| CiteError::Parse(format!("{meta_file}: {e}")))?
         } else {
             Metadata::default()
         };
@@ -166,23 +46,28 @@ impl ProjectContext {
         })
     }
 
-    pub fn content_dir(&self) -> PathBuf {
-        self.root.join("content")
-    }
-
     pub fn build_dir(&self) -> PathBuf {
         self.root.join("build")
     }
 
-    pub fn content_files(&self) -> Vec<PathBuf> {
-        self.metadata
-            .referenced_files()
-            .iter()
+    /// The compiled bundle `cite build` writes and `cite deploy` reads.
+    pub fn bundle_path(&self) -> PathBuf {
+        self.build_dir().join("content.json")
+    }
+
+    /// Every file a build reads: the project config, the metadata file, and the
+    /// content and assets it references. A change to any of them triggers a rebuild.
+    pub fn source_files(&self) -> Vec<PathBuf> {
+        let config = ["cite.toml", self.manifest.project.metadata_file.as_str()];
+        let referenced = self.metadata.referenced_files();
+        config
+            .into_iter()
+            .chain(referenced.iter().map(String::as_str))
             .map(|f| self.root.join(f))
             .collect()
     }
 
-    pub async fn clean(&self, db: &crate::core::db::DbManager) -> Result<(), CiteError> {
+    pub async fn clean(&self, db: &DbManager) -> Result<(), CiteError> {
         let build_dir = self.build_dir();
         if build_dir.exists() {
             tokio::fs::remove_dir_all(&build_dir).await?;
@@ -190,57 +75,6 @@ impl ProjectContext {
 
         let _ = db.clear_cache(&self.project_id()).await;
         Ok(())
-    }
-}
-
-pub async fn print_status(db: &crate::core::db::DbManager, ctx: &ProjectContext) {
-    info!("Name: {}", ctx.manifest.project.name);
-    info!("Root: {}", ctx.root.display());
-    info!("Artist ID: {}", ctx.manifest.project.artist_id);
-    if let Some(b) = &ctx.manifest.backend
-        && let Some(u) = &b.staging_url
-    {
-        info!("Staging: {u}");
-    }
-    info!("Podcasts: {}", ctx.metadata.podcasts.len());
-
-    let project_id = ctx.project_id();
-
-    if let Ok(stats) = db.get_project_stats(&project_id).await {
-        info!("Total words: {}", stats.total_words);
-        info!("Timeline entries: {}", stats.timeline_count);
-        info!("Builds recorded: {}", stats.build_count);
-        if let Some(ref last) = stats.last_built {
-            info!("Last build: {last}");
-        }
-        info!("Deployments: {}", stats.deployment_count);
-        if let Some(ref last) = stats.last_deployed {
-            info!("Last deploy: {last}");
-        }
-    }
-
-    if let Ok(builds) = db.get_build_history(&project_id).await
-        && let Some(b) = builds.first()
-    {
-        info!(
-            "Recent build: {} podcasts, {} timelines, {} words, {}ms ({})",
-            b.podcast_count,
-            b.timeline_count,
-            b.total_words,
-            b.duration_ms,
-            if b.was_incremental { "incr" } else { "full" },
-        );
-    }
-
-    if let Ok(deploys) = db.get_deployment_history(&project_id).await
-        && let Some(d) = deploys.first()
-    {
-        info!(
-            "Recent deploy: {} at {} ({})",
-            d.deployment_id,
-            d.deployed_at,
-            if d.success { "ok" } else { "fail" },
-        );
     }
 }
 
@@ -342,14 +176,6 @@ incremental = true
     }
 
     #[test]
-    fn test_project_context_content_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("cite.toml"), "[project]\nname = \"x\"\n").unwrap();
-        let ctx = ProjectContext::load(dir.path()).unwrap();
-        assert_eq!(ctx.content_dir(), dir.path().join("content"));
-    }
-
-    #[test]
     fn test_project_context_build_dir() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("cite.toml"), "[project]\nname = \"x\"\n").unwrap();
@@ -375,11 +201,7 @@ incremental = true
         assert!(ctx.build_dir().exists());
         let db_path = dir.path().join("test.db");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let db = rt.block_on(async {
-            crate::core::db::DbManager::open_path(&db_path)
-                .await
-                .unwrap()
-        });
+        let db = rt.block_on(async { DbManager::open_path(&db_path).await.unwrap() });
         rt.block_on(ctx.clean(&db)).unwrap();
         assert!(!ctx.build_dir().exists());
     }

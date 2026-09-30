@@ -9,6 +9,28 @@ use symphonia::core::meta::MetadataOptions;
 
 use crate::core::CiteError;
 
+/// Audio extensions accepted by the `podcasts` storage bucket.
+pub const AUDIO_FORMATS: &[&str] = &["mp3", "wav", "m4a", "aac"];
+/// `podcasts` bucket `file_size_limit` (100 MB).
+pub const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024;
+pub const IMAGE_FORMATS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
+pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// MIME type sent on upload; audio types match the bucket's `allowed_mime_types`.
+pub fn mime_type(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/m4a",
+        "aac" => "audio/aac",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioMeta {
     pub duration_secs: f64,
@@ -191,6 +213,67 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    /// A valid PCM WAV file of `secs` seconds of silence (mono, 16-bit).
+    fn wav(secs: u32, rate: u32) -> Vec<u8> {
+        let data_len = secs * rate * 2;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // mono
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(out.len() + data_len as usize, 0);
+        out
+    }
+
+    #[test]
+    fn test_audio_duration_and_format_are_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("ep.WAV");
+        std::fs::write(&f, wav(2, 8000)).unwrap();
+
+        let meta = extract_audio(&f).unwrap();
+        assert!(
+            (meta.duration_secs - 2.0).abs() < 0.01,
+            "{}",
+            meta.duration_secs
+        );
+        assert_eq!(meta.format, "wav");
+        assert_eq!(meta.sample_rate_hz, 8000);
+        assert_eq!(meta.channels, 1);
+        assert_eq!(meta.bitrate_kbps, 128);
+        assert!(!meta.sha256.is_empty());
+        assert!(
+            inspect_audio(&f).unwrap().sha256.is_empty(),
+            "inspect skips hashing"
+        );
+    }
+
+    #[test]
+    fn test_unreadable_audio_has_no_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("fake.mp3");
+        std::fs::write(&f, b"not audio").unwrap();
+        let meta = inspect_audio(&f).unwrap();
+        assert_eq!(meta.duration_secs, 0.0);
+        assert_eq!(meta.codec, "unknown");
+    }
+
+    #[test]
+    fn test_mime_type_matches_podcasts_bucket() {
+        assert_eq!(mime_type("MP3"), "audio/mpeg");
+        assert_eq!(mime_type("m4a"), "audio/m4a");
+        assert_eq!(mime_type("jpeg"), "image/jpeg");
+        assert_eq!(mime_type("xyz"), "application/octet-stream");
     }
 
     #[test]

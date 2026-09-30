@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const ARTIST: &str = "11111111-1111-1111-1111-111111111111";
+
 struct ProjectHarness {
     _dir: tempfile::TempDir,
     project: PathBuf,
@@ -28,10 +30,16 @@ impl ProjectHarness {
         }
     }
 
+    /// Runs cite isolated from the developer's `~/.cite` login and credentials.
     fn cmd(args: &[&str], db_path: &Path) -> (String, String, bool) {
+        let home = db_path.parent().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_cite"))
             .args(args)
             .env("CITE_DB_PATH", db_path.to_str().unwrap())
+            .env("HOME", home)
+            .env("CITE_CREDS_PATH", home.join("no-credentials.toml"))
+            .env_remove("CITE_SUPABASE_URL")
+            .env_remove("CITE_SUPABASE_API_KEY")
             .output()
             .expect("Failed to run cite");
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -66,6 +74,19 @@ impl ProjectHarness {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, text).unwrap();
+    }
+
+    /// Points the project at a valid artist, without a backend.
+    fn set_artist(&self) {
+        let toml = format!(
+            "[project]\nname = \"{}\"\nartist_id = \"{ARTIST}\"\n",
+            self.name()
+        );
+        fs::write(self.project.join("cite.toml"), toml).unwrap();
+    }
+
+    fn name(&self) -> &str {
+        self.project.file_name().unwrap().to_str().unwrap()
     }
 
     fn read_bundle(&self) -> serde_json::Value {
@@ -109,12 +130,6 @@ fn init_is_idempotent_on_existing_project() {
 // ── doctor ────────────────────────────────────────────────────
 
 #[test]
-fn doctor_passes_on_empty_project() {
-    let h = ProjectHarness::new("empty");
-    h.run_ok(&["doctor"]);
-}
-
-#[test]
 fn doctor_catches_missing_file() {
     let h = ProjectHarness::new("missing-file");
     h.write_metadata(
@@ -149,11 +164,12 @@ fn doctor_warns_on_short_content() {
 podcasts:
   - title: "A"
     file: content/a.md
+    category: tech
 "#,
     );
     let (_, stderr, ok) = h.run(&["doctor"]);
     assert!(ok);
-    assert!(stderr.contains("low word count") || stderr.contains("very short"));
+    assert!(stderr.contains("low word count"), "{stderr}");
 }
 
 // ── build ───────────────────────────────────────────────────────
@@ -171,22 +187,22 @@ podcasts:
 "#,
     );
 
-    let re = regex::Regex::new(r#"(?m)^(artist_id\s*=\s*)"[^"]*""#).unwrap();
-    let toml = fs::read_to_string(h.project.join("cite.toml")).unwrap();
-    let toml = re.replace(&toml, r#"$1"alice_uuid""#).to_string();
-    fs::write(h.project.join("cite.toml"), toml).unwrap();
+    h.set_artist();
     h.run_ok(&["build"]);
 
     let bundle = h.read_bundle();
     assert!(h.project.join("build").exists());
     assert_eq!(bundle["project"], "build-test");
     assert_eq!(bundle["compiler_version"], 1.0);
-    assert_eq!(bundle["artist_id"], "alice_uuid");
+    assert_eq!(bundle["artist_id"], ARTIST);
     assert_eq!(bundle["podcasts"].as_array().unwrap().len(), 1);
     let pod = &bundle["podcasts"][0];
     assert!(!pod["id"].as_str().unwrap().is_empty());
     assert_eq!(pod["title"], "My Podcast");
-    assert_eq!(pod["content"], "# Hello World");
+    assert_eq!(
+        pod["content"], "# Hello World",
+        "Markdown embedded verbatim"
+    );
 }
 
 #[test]
@@ -248,60 +264,31 @@ podcasts:
     );
     assert_eq!(entries[1]["date"], "2024-01");
     assert_eq!(entries[1]["url"], "https://example.com/follow-up");
-    assert_eq!(entries[1]["link"], "https://example.com/news/related-story");
 }
 
 #[test]
-fn build_is_idempotent_with_cache() {
+fn build_skips_unchanged_sources_and_rebuilds_changed_ones() {
     let h = ProjectHarness::new("cached-build");
-    h.write_content("content/article.md", "# Same");
-    h.write_metadata(
-        r#"
-podcasts:
-  - title: "A"
-    file: content/article.md
-"#,
-    );
+    h.write_content("content/a.md", "v1");
+    h.write_metadata("podcasts:\n  - title: A\n    file: content/a.md\n");
 
-    h.run_ok(&["build"]);
-    let first = h.read_bundle();
-
-    let (_, stderr, ok) = h.run(&["build"]);
-    assert!(ok, "cached build: {stderr}");
-
-    h.run_ok(&["build", "--force"]);
-
-    let second = h.read_bundle();
-    let first_content = &first["podcasts"][0]["content"];
-    let second_content = &second["podcasts"][0]["content"];
-    assert_eq!(
-        first_content, second_content,
-        "force rebuild content should match"
-    );
-    assert_eq!(first["project"], second["project"]);
-    assert_eq!(first["artist_id"], second["artist_id"]);
-}
-
-#[test]
-fn build_does_not_resolve_wiki_links() {
-    let h = ProjectHarness::new("no-wiki-test");
-    h.write_content("content/main.md", "See [[other-page]] for details");
-    h.write_metadata(
-        r#"
-podcasts:
-  - title: "Main"
-    file: content/main.md
-"#,
-    );
-
-    h.run_ok(&["build"]);
-
-    let bundle = h.read_bundle();
-    let content = bundle["podcasts"][0]["content"].as_str().unwrap();
+    let stderr = h.run_ok(&["build"]);
+    assert!(stderr.contains("Built 1 podcast"), "{stderr}");
     assert!(
-        content.contains("[[other-page]]"),
-        "wiki-link should remain as-is, got: {content}"
+        !stderr.contains("(incremental)"),
+        "first build is full: {stderr}"
     );
+
+    let stderr = h.run_ok(&["build"]);
+    assert!(stderr.contains("Nothing to rebuild"), "{stderr}");
+
+    h.write_content("content/a.md", "v2");
+    let stderr = h.run_ok(&["build"]);
+    assert!(stderr.contains("(incremental)"), "{stderr}");
+    assert_eq!(h.read_bundle()["podcasts"][0]["content"], "v2");
+
+    let stderr = h.run_ok(&["build", "--force"]);
+    assert!(stderr.contains("Built 1 podcast"), "{stderr}");
 }
 
 #[test]
@@ -311,29 +298,6 @@ fn build_empty_project_succeeds() {
     let bundle = h.read_bundle();
     let pods = bundle["podcasts"].as_array().unwrap();
     assert_eq!(pods.len(), 0, "template has no default podcast");
-}
-
-#[test]
-fn build_force_rebuilds() {
-    let h = ProjectHarness::new("force-build");
-    h.write_content("content/a.md", "v1");
-    h.write_metadata(
-        r#"
-podcasts:
-  - title: "A"
-    file: content/a.md
-"#,
-    );
-    h.run_ok(&["build"]);
-    let first = h.read_bundle();
-
-    h.run_ok(&["build", "--force"]);
-    let second = h.read_bundle();
-    assert_eq!(
-        first["podcasts"][0]["content"],
-        second["podcasts"][0]["content"]
-    );
-    assert_eq!(second["compiler_version"], 1.0);
 }
 
 // ── status ──────────────────────────────────────────────────────
@@ -347,6 +311,7 @@ fn doctor_shows_project_info_with_status() {
 podcasts:
   - title: "A"
     file: content/a.md
+    category: tech
 "#,
     );
 
@@ -358,6 +323,7 @@ podcasts:
 
     let stderr = h.run_ok(&["doctor"]);
     assert!(stderr.contains("Podcasts: 1"));
+    assert!(stderr.contains("Last build:"));
 }
 
 // ── doctor ──────────────────────────────────────────────────────
@@ -375,7 +341,7 @@ fn doctor_detects_missing_project() {
 }
 
 #[test]
-fn doctor_shows_project_health() {
+fn doctor_passes_on_new_project() {
     let h = ProjectHarness::new("doctor-test");
     let stderr = h.run_ok(&["doctor"]);
     assert!(stderr.contains("cite.toml found"));
@@ -409,26 +375,62 @@ podcasts:
 #[test]
 fn deploy_fails_without_backend() {
     let h = ProjectHarness::new("no-backend");
+    fs::write(
+        h.project.join("cite.toml"),
+        "[project]\nname = \"no-backend\"\nartist_id = \"11111111-1111-1111-1111-111111111111\"\n",
+    )
+    .unwrap();
     let (_, stderr, ok) = h.run(&["deploy"]);
     assert!(!ok);
-    assert!(
-        stderr.contains("No [backend]")
-            || stderr.contains("No build artifact")
-            || stderr.contains("No credentials found")
-            || stderr.contains("credentials")
-    );
+    assert!(stderr.contains("No credentials found"), "{stderr}");
 }
 
 #[test]
-fn deploy_fails_without_build() {
-    let h = ProjectHarness::new("no-build");
+fn deploy_requires_valid_artist_id() {
+    let h = ProjectHarness::new("no-artist");
     fs::write(
         h.project.join("cite.toml"),
         "[project]\nname = \"no-build\"\nversion = \"0.1.0\"\nlanguage = \"en\"\nmetadata_file = \"metadata.yml\"\nartist_id = \"\"\n\n[build]\ncompiler_version = 0.0\nincremental = true\noutput_format = \"json\"\n\n[backend]\nstaging_url = \"https://test.supabase.co\"\nstaging_service_key = \"test-key\"\n",
     ).unwrap();
     let (_, stderr, ok) = h.run(&["deploy"]);
     assert!(!ok);
-    assert!(stderr.contains("No build artifact"));
+    assert!(stderr.contains("artist_id"), "{stderr}");
+}
+
+#[test]
+fn deploy_refuses_invalid_metadata_before_connecting() {
+    let h = ProjectHarness::new("invalid-deploy");
+    h.set_artist();
+    h.write_content("content/a.md", "# A");
+    h.write_metadata(&format!(
+        "podcasts:\n  - title: A\n    file: content/a.md\n    summary: {}\n",
+        "word ".repeat(51)
+    ));
+    let (_, stderr, ok) = h.run(&["deploy"]);
+    assert!(!ok);
+    assert!(stderr.contains("Fix 2 problem(s)"), "{stderr}");
+    assert!(stderr.contains("no category"), "{stderr}");
+    assert!(stderr.contains("summary has 51 words"), "{stderr}");
+    assert!(
+        !stderr.contains("credentials"),
+        "validated before connecting: {stderr}"
+    );
+    assert!(!h.project.join("build").exists(), "nothing built");
+}
+
+#[test]
+fn misspelled_metadata_key_is_reported_with_its_line() {
+    let h = ProjectHarness::new("typo");
+    h.write_metadata("podcasts:\n  - title: A\n    file: content/a.md\n    catgory: tech\n");
+    for command in ["doctor", "build", "deploy"] {
+        let (_, stderr, ok) = h.run(&[command]);
+        assert!(!ok, "{command} must fail");
+        assert!(
+            stderr.contains("metadata.yml: podcasts[0]: unknown field `catgory`")
+                && stderr.contains("line 4"),
+            "{command}: {stderr}"
+        );
+    }
 }
 
 // ── rollback ────────────────────────────────────────────────────
@@ -450,7 +452,7 @@ fn rollback_fails_without_backend() {
 #[test]
 fn full_workflow_end_to_end() {
     let h = ProjectHarness::new("e2e");
-
+    h.set_artist();
     h.write_content("content/ai.md", "# AI Article\nSome content about AI.");
     h.write_content("content/ml.md", "# ML Article\nSome content about ML.");
     h.write_metadata(
@@ -459,6 +461,12 @@ podcasts:
   - title: "AI Article"
     file: content/ai.md
     category: tech
+    source_url: www.example.com/ai
+    timeline:
+      - content/ml.md
+      - title: Launch
+        date: May 22, 2025
+        link: example.com/launch
   - title: "ML Article"
     file: content/ml.md
     category: tech
@@ -466,16 +474,20 @@ podcasts:
     );
 
     h.run_ok(&["doctor"]);
-    h.run_ok(&["build"]);
-    let bundle = h.read_bundle();
-    assert_eq!(bundle["project"], "e2e");
-    assert_eq!(bundle["podcasts"].as_array().unwrap().len(), 2);
+    // No explicit build: deploy builds, and --dry-run never contacts Supabase.
+    let (stdout, stderr, ok) = h.run(&["deploy", "--dry-run"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("Dry run complete"), "{stdout}");
     assert!(
-        bundle["podcasts"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("AI")
+        stderr.contains("Dry run: 2 podcast(s), 0 update(s), 2 new"),
+        "{stderr}"
     );
+
+    let bundle = h.read_bundle();
+    let ai = &bundle["podcasts"][0];
+    assert_eq!(ai["source_url"], "https://www.example.com/ai");
+    assert_eq!(ai["timeline"][0], "content/ml.md");
+    assert_eq!(ai["timeline"][1]["url"], "https://example.com/launch");
     assert!(
         bundle["podcasts"][1]["content"]
             .as_str()
@@ -515,6 +527,7 @@ fn json_flag_produces_valid_json() {
 podcasts:
   - title: "JSON Article"
     file: content/a.md
+    category: tech
 "#,
     );
     let (stdout, _, ok) = h.run(&["doctor", "--json"]);

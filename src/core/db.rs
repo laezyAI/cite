@@ -6,7 +6,9 @@ use tracing::info;
 
 use crate::core::CiteError;
 use crate::core::cache::BuildCache;
-use crate::core::compiler::{ContentBundle, word_count};
+use crate::core::compiler::ContentBundle;
+use crate::core::markdown::word_count;
+use crate::core::metadata::{Podcast, TimelineEntry};
 use crate::core::project::ProjectContext;
 
 pub fn global_db_path() -> PathBuf {
@@ -15,8 +17,123 @@ pub fn global_db_path() -> PathBuf {
         .unwrap_or_else(|| crate::core::cite_home().join("cite.db"))
 }
 
+/// The local database (`~/.cite/cite.db`): a snapshot of each project's last build
+/// plus build and deploy history, used for analytics and restoring archived projects.
 pub struct DbManager {
     conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildRecord {
+    pub project_id: String,
+    pub compiler_version: f64,
+    pub podcast_count: i64,
+    pub timeline_count: i64,
+    pub total_words: i64,
+    pub duration_ms: i64,
+    pub was_incremental: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeployReport {
+    pub project_id: String,
+    pub deployment_id: String,
+    pub news_count: i64,
+    pub timeline_count: i64,
+    pub asset_count: i64,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredPodcast {
+    pub title: String,
+    pub word_count: i64,
+    pub category: String,
+    pub file: String,
+    pub has_audio: bool,
+    pub has_thumbnail: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredTimeline {
+    pub date: Option<String>,
+    pub title: String,
+    pub url: Option<String>,
+    pub entry_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredDeployment {
+    pub deployment_id: String,
+    pub deployed_at: String,
+    pub success: bool,
+    pub news_count: i64,
+    pub asset_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredBuild {
+    pub podcast_count: i64,
+    pub total_words: i64,
+    pub duration_ms: i64,
+    pub was_incremental: bool,
+    pub built_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectStats {
+    pub podcast_count: i64,
+    pub timeline_count: i64,
+    pub total_words: i64,
+    pub build_count: i64,
+    pub last_built: Option<String>,
+    pub deployment_count: i64,
+    pub last_deployed: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AllStats {
+    pub project_count: i64,
+    pub total_podcasts: i64,
+    pub total_timelines: i64,
+    pub total_words: i64,
+    pub total_builds: i64,
+}
+
+/// A podcast row with everything needed to restore project files.
+#[derive(Debug, Clone)]
+pub struct RestoredPodcast {
+    pub id: String,
+    pub title: String,
+    pub file: String,
+    pub source_url: Option<String>,
+    pub category: Option<String>,
+    pub thumbnail: Option<String>,
+    pub audio: Option<String>,
+    pub citation_file: Option<String>,
+    /// The podcast's metadata.yml entry as written; `None` in snapshots from older versions.
+    pub metadata: Option<Podcast>,
+    pub content: Option<String>,
+}
+
+/// A timeline event and the podcast it belongs to.
+#[derive(Debug, Clone)]
+pub struct RestoredTimeline {
+    pub podcast_id: String,
+    /// From the podcast's BibTeX file, rather than written inline in metadata.
+    pub from_citation: bool,
+    pub entry: TimelineEntry,
+}
+
+/// Project-level data for restoring an archived project.
+#[derive(Debug, Clone)]
+pub struct RestoredProject {
+    pub name: String,
+    pub language: String,
+    pub artist_id: String,
+    pub metadata_file: String,
+    pub podcasts: Vec<RestoredPodcast>,
+    pub timelines: Vec<RestoredTimeline>,
 }
 
 fn get_opt_string(row: &libsql::Row, idx: i32) -> String {
@@ -29,6 +146,26 @@ fn get_opt_string(row: &libsql::Row, idx: i32) -> String {
 fn opt_string(row: &libsql::Row, idx: i32) -> Option<String> {
     let s = get_opt_string(row, idx);
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// Parameters for inserting one row of `timeline_entries`.
+fn entry_params(
+    id: &str,
+    project_id: &str,
+    podcast_id: &str,
+    entry: &TimelineEntry,
+    entry_type: &str,
+) -> [libsql::Result<Value>; 8] {
+    params![
+        id,
+        project_id,
+        podcast_id,
+        entry.date.as_deref(),
+        entry.title.as_str(),
+        entry.description.as_deref(),
+        entry.url.as_deref(),
+        entry_type,
+    ]
 }
 
 impl DbManager {
@@ -130,16 +267,10 @@ impl DbManager {
             }
         }
 
-        if self
-            .conn
-            .query("SELECT link FROM timeline_entries LIMIT 1", ())
-            .await
-            .is_err()
-        {
-            self.conn
-                .execute("ALTER TABLE timeline_entries ADD COLUMN link TEXT", ())
-                .await?;
-        }
+        // Older versions kept a BibTeX `link` apart from `url`; it is now read as a fallback.
+        self.add_column_if_missing("timeline_entries", "link")
+            .await?;
+        self.add_column_if_missing("podcasts", "metadata").await?;
 
         let mut rows = self
             .conn
@@ -156,6 +287,16 @@ impl DbManager {
                 .await?;
         }
 
+        Ok(())
+    }
+
+    /// Adds a nullable TEXT column to databases created by an older version.
+    async fn add_column_if_missing(&self, table: &str, column: &str) -> Result<(), CiteError> {
+        let probe = format!("SELECT {column} FROM {table} LIMIT 1");
+        if self.conn.query(&probe, ()).await.is_err() {
+            let alter = format!("ALTER TABLE {table} ADD COLUMN {column} TEXT");
+            self.conn.execute(&alter, ()).await?;
+        }
         Ok(())
     }
 
@@ -199,12 +340,16 @@ impl DbManager {
         )
         .await?;
 
+        let insert_entry = "INSERT INTO timeline_entries
+                (id, project_id, podcast_id, date, title, summary, url, entry_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
         for pod in &bundle.podcasts {
             let meta = &pod.podcast;
+            let metadata = serde_json::to_string(meta)?;
             tx.execute(
                 "INSERT INTO podcasts (id, project_id, title, file, source_url, category,
-                        thumbnail, audio, citation_file, content, word_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        thumbnail, audio, citation_file, content, word_count, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     pod.id.as_str(),
                     project_id.as_str(),
@@ -217,27 +362,32 @@ impl DbManager {
                     meta.citation(),
                     pod.content.as_deref(),
                     pod.content.as_deref().map_or(0, word_count),
+                    metadata,
                 ],
             )
             .await?;
+
+            for (i, entry) in meta.inline_events().enumerate() {
+                let id = format!("{}-event-{i}", pod.id);
+                tx.execute(
+                    insert_entry,
+                    entry_params(&id, &project_id, &pod.id, entry, "event"),
+                )
+                .await?;
+            }
         }
 
         for timeline in &bundle.timelines {
             for entry in &timeline.entries {
                 tx.execute(
-                    "INSERT INTO timeline_entries
-                        (id, project_id, podcast_id, date, title, summary, url, link)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        entry.id.as_str(),
-                        project_id.as_str(),
-                        timeline.podcast_id.as_str(),
-                        entry.date.as_deref(),
-                        entry.title.as_str(),
-                        entry.summary.as_deref(),
-                        entry.url.as_deref(),
-                        entry.link.as_deref(),
-                    ],
+                    insert_entry,
+                    entry_params(
+                        &entry.id,
+                        &project_id,
+                        &timeline.podcast_id,
+                        entry,
+                        "citation",
+                    ),
                 )
                 .await?;
             }
@@ -323,10 +473,7 @@ impl DbManager {
         Ok(())
     }
 
-    pub async fn record_build(
-        &self,
-        record: &super::project::BuildRecord,
-    ) -> Result<(), CiteError> {
+    pub async fn record_build(&self, record: &BuildRecord) -> Result<(), CiteError> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
         self.conn
@@ -350,28 +497,23 @@ impl DbManager {
         Ok(())
     }
 
-    pub async fn record_deployment(
-        &self,
-        report: &super::project::DeployReport,
-    ) -> Result<(), CiteError> {
+    pub async fn record_deployment(&self, report: &DeployReport) -> Result<(), CiteError> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
         self.conn
             .execute(
                 "INSERT INTO deployment_history
-                        (id, project_id, deployment_id, deployed_at, storage_path, news_count, timeline_count, asset_count, success, dry_run)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        (id, project_id, deployment_id, deployed_at, news_count, timeline_count, asset_count, success)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     id,
                     report.project_id.clone(),
                     report.deployment_id.clone(),
                     now,
-                    report.storage_path.clone(),
                     report.news_count,
                     report.timeline_count,
                     report.asset_count,
                     report.success as i64,
-                    report.dry_run as i64,
                 ],
             )
             .await?;
@@ -381,7 +523,7 @@ impl DbManager {
     pub async fn get_podcasts_with_content(
         &self,
         project_id: &str,
-    ) -> Result<Vec<super::project::StoredPodcast>, CiteError> {
+    ) -> Result<Vec<StoredPodcast>, CiteError> {
         let mut rows = self
             .conn
             .query(
@@ -393,7 +535,7 @@ impl DbManager {
 
         let mut podcasts = Vec::new();
         while let Some(row) = rows.next().await? {
-            podcasts.push(super::project::StoredPodcast {
+            podcasts.push(StoredPodcast {
                 title: row.get(0)?,
                 word_count: row.get(1)?,
                 category: get_opt_string(&row, 2),
@@ -405,14 +547,11 @@ impl DbManager {
         Ok(podcasts)
     }
 
-    pub async fn get_timelines(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<super::project::StoredTimeline>, CiteError> {
+    pub async fn get_timelines(&self, project_id: &str) -> Result<Vec<StoredTimeline>, CiteError> {
         let mut rows = self
             .conn
             .query(
-                "SELECT date, title, url, entry_type, link
+                "SELECT date, title, COALESCE(url, link), entry_type
                  FROM timeline_entries WHERE project_id = ?1
                  ORDER BY date DESC NULLS LAST",
                 params![project_id],
@@ -421,12 +560,11 @@ impl DbManager {
 
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {
-            entries.push(super::project::StoredTimeline {
+            entries.push(StoredTimeline {
                 date: opt_string(&row, 0),
                 title: row.get(1)?,
                 url: opt_string(&row, 2),
                 entry_type: opt_string(&row, 3),
-                link: opt_string(&row, 4),
             });
         }
         Ok(entries)
@@ -435,9 +573,7 @@ impl DbManager {
     pub async fn get_restore_snapshot(
         &self,
         project_id: &str,
-    ) -> Result<super::project::RestoredProject, CiteError> {
-        use super::project::{RestoredPodcast, RestoredProject, RestoredTimeline};
-
+    ) -> Result<RestoredProject, CiteError> {
         let mut rows = self
             .conn
             .query(
@@ -468,7 +604,7 @@ impl DbManager {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, title, file, source_url, category, thumbnail, audio, citation_file, content
+                "SELECT id, title, file, source_url, category, thumbnail, audio, citation_file, content, metadata
                  FROM podcasts WHERE project_id = ?1 ORDER BY file",
                 params![project_id],
             )
@@ -484,13 +620,14 @@ impl DbManager {
                 audio: opt_string(&row, 6),
                 citation_file: opt_string(&row, 7),
                 content: opt_string(&row, 8),
+                metadata: opt_string(&row, 9).and_then(|json| serde_json::from_str(&json).ok()),
             });
         }
 
         let mut rows = self
             .conn
             .query(
-                "SELECT podcast_id, date, title, summary, url, link
+                "SELECT podcast_id, date, title, summary, COALESCE(url, link), entry_type
                  FROM timeline_entries WHERE project_id = ?1
                  ORDER BY date ASC NULLS LAST",
                 params![project_id],
@@ -499,11 +636,14 @@ impl DbManager {
         while let Some(row) = rows.next().await? {
             snapshot.timelines.push(RestoredTimeline {
                 podcast_id: row.get(0)?,
-                date: opt_string(&row, 1),
-                title: get_opt_string(&row, 2),
-                summary: opt_string(&row, 3),
-                url: opt_string(&row, 4),
-                link: opt_string(&row, 5),
+                from_citation: opt_string(&row, 5).as_deref() != Some("event"),
+                entry: TimelineEntry {
+                    id: String::new(),
+                    date: opt_string(&row, 1),
+                    title: get_opt_string(&row, 2),
+                    description: opt_string(&row, 3),
+                    url: opt_string(&row, 4),
+                },
             });
         }
 
@@ -513,12 +653,12 @@ impl DbManager {
     pub async fn get_deployment_history(
         &self,
         project_id: &str,
-    ) -> Result<Vec<super::project::StoredDeployment>, CiteError> {
+    ) -> Result<Vec<StoredDeployment>, CiteError> {
         let mut rows = self
             .conn
             .query(
                 "SELECT deployment_id, deployed_at, success, news_count, asset_count
-                 FROM deployment_history WHERE project_id = ?1
+                 FROM deployment_history WHERE project_id = ?1 AND dry_run = 0
                  ORDER BY deployed_at DESC",
                 params![project_id],
             )
@@ -526,7 +666,7 @@ impl DbManager {
 
         let mut deployments = Vec::new();
         while let Some(row) = rows.next().await? {
-            deployments.push(super::project::StoredDeployment {
+            deployments.push(StoredDeployment {
                 deployment_id: row.get(0)?,
                 deployed_at: row.get(1)?,
                 success: row.get::<i64>(2)? != 0,
@@ -537,14 +677,11 @@ impl DbManager {
         Ok(deployments)
     }
 
-    pub async fn get_build_history(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<super::project::StoredBuild>, CiteError> {
+    pub async fn get_build_history(&self, project_id: &str) -> Result<Vec<StoredBuild>, CiteError> {
         let mut rows = self
             .conn
             .query(
-                "SELECT podcast_count, timeline_count, total_words, duration_ms, was_incremental, built_at
+                "SELECT podcast_count, total_words, duration_ms, was_incremental, built_at
                  FROM build_history WHERE project_id = ?1
                  ORDER BY built_at DESC
                  LIMIT 50",
@@ -554,22 +691,18 @@ impl DbManager {
 
         let mut builds = Vec::new();
         while let Some(row) = rows.next().await? {
-            builds.push(super::project::StoredBuild {
+            builds.push(StoredBuild {
                 podcast_count: row.get(0)?,
-                timeline_count: row.get(1)?,
-                total_words: row.get(2)?,
-                duration_ms: row.get(3)?,
-                was_incremental: row.get::<i64>(4)? != 0,
-                built_at: get_opt_string(&row, 5),
+                total_words: row.get(1)?,
+                duration_ms: row.get(2)?,
+                was_incremental: row.get::<i64>(3)? != 0,
+                built_at: get_opt_string(&row, 4),
             });
         }
         Ok(builds)
     }
 
-    pub async fn get_project_stats(
-        &self,
-        project_id: &str,
-    ) -> Result<super::project::ProjectStats, CiteError> {
+    pub async fn get_project_stats(&self, project_id: &str) -> Result<ProjectStats, CiteError> {
         let mut rows = self
             .conn
             .query(
@@ -579,8 +712,8 @@ impl DbManager {
                     (SELECT COALESCE(SUM(word_count), 0) FROM podcasts WHERE project_id = ?1),
                     (SELECT COUNT(*) FROM build_history WHERE project_id = ?1),
                     (SELECT MAX(built_at) FROM build_history WHERE project_id = ?1),
-                    (SELECT COUNT(*) FROM deployment_history WHERE project_id = ?1 AND success = 1),
-                    (SELECT MAX(deployed_at) FROM deployment_history WHERE project_id = ?1 AND success = 1)",
+                    (SELECT COUNT(*) FROM deployment_history WHERE project_id = ?1 AND success = 1 AND dry_run = 0),
+                    (SELECT MAX(deployed_at) FROM deployment_history WHERE project_id = ?1 AND success = 1 AND dry_run = 0)",
                 params![project_id],
             )
             .await?;
@@ -589,7 +722,7 @@ impl DbManager {
             .await?
             .ok_or_else(|| CiteError::Database("Project stats query returned no row".into()))?;
 
-        Ok(super::project::ProjectStats {
+        Ok(ProjectStats {
             podcast_count: row.get(0)?,
             timeline_count: row.get(1)?,
             total_words: row.get(2)?,
@@ -614,7 +747,7 @@ impl DbManager {
         Ok(projects)
     }
 
-    pub async fn get_all_stats(&self) -> Result<super::project::AllStats, CiteError> {
+    pub async fn get_all_stats(&self) -> Result<AllStats, CiteError> {
         let mut rows = self
             .conn
             .query(
@@ -632,7 +765,7 @@ impl DbManager {
             .await?
             .ok_or_else(|| CiteError::Database("Global stats query returned no row".into()))?;
 
-        Ok(super::project::AllStats {
+        Ok(AllStats {
             project_count: row.get(0)?,
             total_podcasts: row.get(1)?,
             total_timelines: row.get(2)?,
@@ -743,8 +876,9 @@ mod tests {
 
         let timelines = db.get_timelines("proj1").await.unwrap();
         assert_eq!(
-            timelines[0].link.as_deref(),
-            Some("https://example.com/news/b")
+            timelines[0].url.as_deref(),
+            Some("https://example.com/a"),
+            "url wins over the legacy link column"
         );
 
         let snap = db.get_restore_snapshot("proj1").await.unwrap();
@@ -758,12 +892,14 @@ mod tests {
             Some("https://example.com")
         );
         assert_eq!(snap.timelines.len(), 1);
-        assert_eq!(snap.timelines[0].title, "Event");
-        assert_eq!(snap.timelines[0].summary.as_deref(), Some("Summary text"));
-        assert_eq!(
-            snap.timelines[0].link.as_deref(),
-            Some("https://example.com/news/b")
+        let entry = &snap.timelines[0].entry;
+        assert_eq!(entry.title, "Event");
+        assert_eq!(entry.description.as_deref(), Some("Summary text"));
+        assert!(
+            snap.timelines[0].from_citation,
+            "untyped rows predate inline events"
         );
+        assert_eq!(entry.url.as_deref(), Some("https://example.com/a"));
 
         assert!(db.get_restore_snapshot("missing").await.is_err());
     }

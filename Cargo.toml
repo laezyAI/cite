@@ -19,7 +19,7 @@ tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros", "fs",
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 sha2 = "0.10"
 percent-encoding = "2.3"
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4", "v5"] }
 colored = "3.0"
 thiserror = "2.0"
 tracing = "0.1"
@@ -28,13 +28,12 @@ ratatui = { version = "0.30.2", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 libsql = { version = "0.10.0-pre.4", features = ["libsql-sys"] }
-symphonia = { version = "0.6", default-features = false, features = ["mp3", "wav", "flac", "vorbis", "isomp4", "aac", "alac", "pcm"] }
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "wav", "isomp4", "aac", "alac", "pcm"] }
 imagesize = "0.15"
 
 [dev-dependencies]
 tempfile = "3.19"
 httpmock = "0.7"
-regex = "1.13.0"
 
 [profile.dist]
 inherits = "release"

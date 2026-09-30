@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{error, info, instrument, warn};
 
+use crate::core::CiteError;
 use crate::core::db::DbManager;
-use crate::core::report::CiteError;
-use crate::core::{compiler, deploy, doctor, project, scaffold, uninstall, upgrade};
+use crate::core::{auth, compiler, deploy, doctor, install, project, scaffold};
 use colored::Colorize;
 
 fn print_json<T: serde::Serialize>(value: &T) {
@@ -44,64 +44,78 @@ fn report_result(cli: &Cli, result: Result<String, CiteError>, err_prefix: &str)
 #[command(
     name = "cite",
     version,
-    about = "Create, validate, build, and deploy podcast content to Supabase"
+    about = "Create, validate, build, and deploy podcast content to Supabase",
+    after_help = "Run without a command to open the interactive dashboard."
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<CliCommand>,
 
+    /// Project directory, or a folder containing several projects
     #[arg(global = true, long, default_value = ".")]
-    pub path: String,
+    pub path: PathBuf,
 
+    /// Show detailed logs
     #[arg(global = true, short, long)]
     pub verbose: bool,
 
-    #[arg(global = true, short, long)]
+    /// Show errors only
+    #[arg(global = true, short, long, conflicts_with = "verbose")]
     pub quiet: bool,
 
+    /// Print machine-readable JSON on stdout
     #[arg(global = true, long)]
     pub json: bool,
-
-    #[arg(global = true, long)]
-    pub dry_run: bool,
 }
 
 #[derive(Subcommand)]
 pub enum CliCommand {
+    /// Create a new project with cite.toml, metadata.yml and folders
     Init {
+        /// Name of the project folder to create
         name: String,
     },
+    /// Compile the project into build/content.json
     Build {
+        /// Rebuild even if nothing changed
         #[arg(long)]
         force: bool,
     },
+    /// Validate, build if needed, and publish episodes to Supabase
     Deploy {
+        /// Show what would be created or updated without contacting Supabase
         #[arg(long)]
-        staging: bool,
+        dry_run: bool,
     },
+    /// Sign in to Supabase and list the artists you can deploy as
     Login {
         #[arg(long)]
         email: Option<String>,
-        #[arg(long)]
+        /// Prefer CITE_PASSWORD or the hidden prompt; flags end up in shell history
+        #[arg(long, env = "CITE_PASSWORD", hide_env_values = true)]
         password: Option<String>,
     },
+    /// Check the project for problems before deploying
     Doctor,
+    /// Remove build output and the incremental build cache
     Clean,
+    /// Remove the news items and uploads a deployment created
     Rollback {
+        /// Deployment id printed by deploy (also shown by doctor)
         id: String,
     },
+    /// Update cite to the latest release
     Upgrade,
+    /// Remove cite and its local data from this machine
     Uninstall,
 }
 
 #[instrument]
 fn load_projects(
-    path: &str,
+    root: &Path,
     empty_msg: &str,
 ) -> Result<Option<Vec<project::ProjectContext>>, CiteError> {
-    let root = PathBuf::from(path);
-    let mut roots = project::discover_projects(&root);
-    roots.sort();
+    let roots = project::discover_projects(root);
     if roots.is_empty() {
         warn!("{empty_msg}");
         return Ok(None);
@@ -118,13 +132,7 @@ impl CliCommand {
         let path = &cli.path;
         match self {
             CliCommand::Init { name } => {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let root = PathBuf::from(path).join(&name);
-                let root = if root.is_absolute() {
-                    root
-                } else {
-                    cwd.join(&root)
-                };
+                let root = std::path::absolute(path.join(&name))?;
                 scaffold::init_project(&name, &root)?;
                 if cli.json {
                     print_json(
@@ -186,7 +194,7 @@ impl CliCommand {
                 }
                 Ok(())
             }
-            CliCommand::Deploy { staging } => {
+            CliCommand::Deploy { dry_run } => {
                 let db = DbManager::open().await?;
                 let Some(projects) = load_projects(path, "No projects found (no cite.toml found)")?
                 else {
@@ -196,17 +204,8 @@ impl CliCommand {
                 let mut has_errors = false;
                 for ctx in &projects {
                     print_group_header(multi, &ctx.manifest.project.name);
-                    let result = if staging {
-                        deploy::deploy_staging(&db, ctx, cli.dry_run).await
-                    } else {
-                        deploy::deploy(&db, ctx, cli.dry_run).await
-                    };
-                    let err_prefix = if staging {
-                        "Staging deploy failed"
-                    } else {
-                        "Deploy failed"
-                    };
-                    if report_result(cli, result, err_prefix) {
+                    let result = deploy::deploy(&db, ctx, dry_run).await;
+                    if report_result(cli, result, "Deploy failed") {
                         has_errors = true;
                     }
                 }
@@ -215,7 +214,12 @@ impl CliCommand {
                         "Deploy failed in one or more projects".to_string(),
                     ));
                 } else if !cli.json {
-                    println!("{}", "Deploy complete".green());
+                    let done = if dry_run {
+                        "Dry run complete"
+                    } else {
+                        "Deploy complete"
+                    };
+                    println!("{}", done.green());
                 }
                 Ok(())
             }
@@ -239,11 +243,11 @@ impl CliCommand {
                 let mut has_warnings = false;
                 for ctx in &projects {
                     print_group_header(multi, &ctx.manifest.project.name);
-                    let outcome = doctor::run(&db, ctx).await?;
+                    let outcome = doctor::run(&db, ctx).await;
                     if cli.json {
-                        if let Ok(v) = serde_json::to_value(&outcome) {
-                            all_outcomes.push(v);
-                        }
+                        let mut value = serde_json::to_value(&outcome)?;
+                        value["project"] = ctx.manifest.project.name.clone().into();
+                        all_outcomes.push(value);
                     } else {
                         outcome.emit();
                     }
@@ -252,9 +256,6 @@ impl CliCommand {
                     }
                     if outcome.has_warnings() {
                         has_warnings = true;
-                    }
-                    if !cli.json {
-                        project::print_status(&db, ctx).await;
                     }
                 }
                 if cli.json {
@@ -290,8 +291,7 @@ impl CliCommand {
                 Ok(())
             }
             CliCommand::Rollback { id } => {
-                let root = PathBuf::from(path);
-                let ctx = project::ProjectContext::load(&root)?;
+                let ctx = project::ProjectContext::load(path)?;
                 let msg = deploy::rollback(&ctx, &id).await?;
                 if cli.json {
                     print_json(&serde_json::json!({"status": "ok", "message": msg}));
@@ -301,26 +301,42 @@ impl CliCommand {
                 Ok(())
             }
             CliCommand::Login { email, password } => {
-                let backend = PathBuf::from(path).canonicalize().ok().and_then(|root| {
-                    if root.join("cite.toml").exists() {
-                        project::ProjectContext::load(&root)
-                            .ok()
-                            .and_then(|ctx| ctx.manifest.backend)
-                    } else {
-                        None
-                    }
-                });
-                deploy::login(None, backend, email, password).await?;
+                let backend = project::ProjectContext::load(path)
+                    .ok()
+                    .and_then(|ctx| ctx.manifest.backend);
+                auth::login(backend, email, password).await?;
                 println!("{}", "Login complete".green());
                 Ok(())
             }
             CliCommand::Upgrade => {
-                let msg = upgrade::upgrade().await?;
+                let msg = install::upgrade().await?;
                 info!("{msg}");
                 println!("{}", "Upgrade complete".green());
                 Ok(())
             }
-            CliCommand::Uninstall => uninstall::uninstall(),
+            CliCommand::Uninstall => install::uninstall(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_dry_run_belongs_to_deploy() {
+        let cli = Cli::try_parse_from(["cite", "deploy", "--dry-run", "--path", "p"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Deploy { dry_run: true })
+        ));
+        assert_eq!(cli.path, PathBuf::from("p"));
+        assert!(Cli::try_parse_from(["cite", "build", "--dry-run"]).is_err());
     }
 }
