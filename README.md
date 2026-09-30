@@ -1,6 +1,6 @@
-# cite-cli
+# cite
 
-Create, validate, build, and deploy podcast content for aoux app.
+Create, validate, build, and deploy podcast content for aoux.
 
 ## Installation
 
@@ -9,33 +9,33 @@ Create, validate, build, and deploy podcast content for aoux app.
 (MacOS/Linux only)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/VinayIN/cite-cli/releases/download/v0.1.0-alpha.4/cite-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/laezyAI/cite/releases/download/v0.1.0-alpha.4/cite-installer.sh | sh
 ```
 
 (Windows only)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/VinayIN/cite-cli/releases/download/v0.1.0-alpha.4/cite-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/laezyAI/cite/releases/download/v0.1.0-alpha.4/cite-installer.ps1 | iex"
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/VinayIN/cite-cli.git
-cd cite-cli
+git clone https://github.com/VinayIN/cite.git
+cd cite
 cargo build --release
-./target/release/cite-cli --help
+./target/release/cite --help
 ```
 
 ## Quick Start
 
 ```bash
-cite-cli init my-project
+cite init my-project
 # edit metadata.yml and add content files
-cite-cli doctor --path my-project
-cite-cli build --path my-project
-cite-cli login
-cite-cli deploy --path my-project
+cite doctor --path my-project
+cite build --path my-project
+cite login
+cite deploy --path my-project
 ```
 
 ## Commands
@@ -59,7 +59,7 @@ cite-cli deploy --path my-project
 
 ## Interactive Terminal UI
 
-Run `cite-cli` with no arguments to enter the TUI:
+Run `cite` with no arguments to enter the TUI:
 
 | Key                 | Action                                                                            |
 | ------------------- | --------------------------------------------------------------------------------- |
@@ -116,7 +116,7 @@ the `CITE_SUPABASE_URL` and `CITE_SUPABASE_API_KEY` environment variables.
 
 ## Local Analytics
 
-cite-cli maintains a local database at `~/.cite/cite.db` for:
+cite maintains a local database at `~/.cite/cite.db` for:
 
 - Compiler cache (file hashes, UUID mappings)
 - Build and deployment history
