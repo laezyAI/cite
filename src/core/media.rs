@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::probe::Hint;
@@ -31,116 +30,54 @@ pub struct ImageMeta {
     pub sha256: String,
 }
 
+/// Full audio metadata, including a content hash (used in build bundles).
 pub fn extract_audio(path: &Path) -> Result<AudioMeta, CiteError> {
-    let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let sha256 = sha256_file(path)?;
-    let ext = path
-        .extension()
+    read_audio_meta(path, true)
+}
+
+/// Audio metadata without hashing the file (cheap; `sha256` is left empty).
+pub fn inspect_audio(path: &Path) -> Result<AudioMeta, CiteError> {
+    read_audio_meta(path, false)
+}
+
+/// Full image metadata, including a content hash (used in build bundles).
+pub fn extract_image(path: &Path) -> Result<ImageMeta, CiteError> {
+    read_image_meta(path, true)
+}
+
+/// Image metadata from the header only (cheap; `sha256` is left empty).
+pub fn inspect_image(path: &Path) -> Result<ImageMeta, CiteError> {
+    read_image_meta(path, false)
+}
+
+fn lowercase_ext(path: &Path) -> String {
+    path.extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let format = ext.clone();
+        .unwrap_or_default()
+        .to_lowercase()
+}
 
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => {
-            return Ok(AudioMeta {
-                duration_secs: 0.0,
-                format,
-                codec: "unknown".into(),
-                bitrate_kbps: 0,
-                sample_rate_hz: 0,
-                channels: 0,
-                size_bytes,
-                sha256,
-            });
-        }
-    };
+struct AudioProbe {
+    duration_secs: f64,
+    codec: String,
+    sample_rate_hz: u32,
+    channels: u32,
+}
 
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension(&ext);
-
-    let probe = symphonia::default::get_probe();
-    let format_reader = match probe.probe(
-        &hint,
-        mss,
-        FormatOptions::default(),
-        MetadataOptions::default(),
-    ) {
-        Ok(f) => f,
-        Err(_) => {
-            return Ok(AudioMeta {
-                duration_secs: 0.0,
-                format,
-                codec: "unknown".into(),
-                bitrate_kbps: 0,
-                sample_rate_hz: 0,
-                channels: 0,
-                size_bytes,
-                sha256,
-            });
-        }
-    };
-
-    let track = match format_reader.tracks().first() {
-        Some(t) => t.clone(),
-        None => {
-            return Ok(AudioMeta {
-                duration_secs: 0.0,
-                format,
-                codec: "unknown".into(),
-                bitrate_kbps: 0,
-                sample_rate_hz: 0,
-                channels: 0,
-                size_bytes,
-                sha256,
-            });
-        }
-    };
-
-    let audio_params = match &track.codec_params {
-        Some(CodecParameters::Audio(p)) => p.clone(),
-        _ => {
-            return Ok(AudioMeta {
-                duration_secs: 0.0,
-                format,
-                codec: "unknown".into(),
-                bitrate_kbps: 0,
-                sample_rate_hz: 0,
-                channels: 0,
-                size_bytes,
-                sha256,
-            });
-        }
-    };
-
-    let codec_name = format!("{:?}", audio_params.codec);
-    let codec = codec_name
-        .strip_prefix("AudioCodecId::")
-        .unwrap_or(&codec_name)
-        .to_lowercase();
-
-    let sample_rate = audio_params.sample_rate.unwrap_or(0);
-    let channels = audio_params.channels.map(|c| c.count() as u32).unwrap_or(0);
-
-    let num_frames = track.num_frames.unwrap_or(0);
-    let duration_secs = if let Some(tb) = track.time_base {
-        let numer = tb.numer.get() as f64;
-        let denom = tb.denom.get() as f64;
-        if numer > 0.0 && denom > 0.0 {
-            num_frames as f64 * numer / denom
-        } else if sample_rate > 0 {
-            num_frames as f64 / sample_rate as f64
-        } else {
-            0.0
-        }
-    } else if sample_rate > 0 {
-        num_frames as f64 / sample_rate as f64
+fn read_audio_meta(path: &Path, with_hash: bool) -> Result<AudioMeta, CiteError> {
+    let size_bytes = std::fs::metadata(path)?.len();
+    let sha256 = if with_hash {
+        crate::core::cache::sha256_file(path)?
     } else {
-        0.0
+        String::new()
     };
+    let format = lowercase_ext(path);
 
+    let probe = probe_audio(path, &format);
+    let (duration_secs, codec, sample_rate_hz, channels) = match probe {
+        Some(p) => (p.duration_secs, p.codec, p.sample_rate_hz, p.channels),
+        None => (0.0, "unknown".to_string(), 0, 0),
+    };
     let bitrate_kbps = if duration_secs > 0.0 && size_bytes > 0 {
         ((size_bytes as f64 * 8.0) / (duration_secs * 1000.0)).round() as u32
     } else {
@@ -152,34 +89,71 @@ pub fn extract_audio(path: &Path) -> Result<AudioMeta, CiteError> {
         format,
         codec,
         bitrate_kbps,
-        sample_rate_hz: sample_rate,
+        sample_rate_hz,
         channels,
         size_bytes,
         sha256,
     })
 }
 
-pub fn extract_image(path: &Path) -> Result<ImageMeta, CiteError> {
-    let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let sha256 = sha256_file(path)?;
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let format = match ext.as_str() {
-        "jpg" | "jpeg" => "jpeg",
-        "png" => "png",
-        "webp" => "webp",
-        "gif" => "gif",
-        _ => &ext,
-    }
-    .to_string();
+/// Read container headers only; returns `None` for unreadable or non-audio files.
+fn probe_audio(path: &Path, ext: &str) -> Option<AudioProbe> {
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(ext);
 
-    let (width, height) = match imagesize::size(path) {
-        Ok(d) => (d.width as u32, d.height as u32),
-        Err(_) => (0, 0),
+    let reader = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .ok()?;
+    let track = reader.tracks().first()?;
+    let Some(CodecParameters::Audio(params)) = &track.codec_params else {
+        return None;
     };
+
+    let codec_name = format!("{:?}", params.codec);
+    let codec = codec_name
+        .strip_prefix("AudioCodecId::")
+        .unwrap_or(&codec_name)
+        .to_lowercase();
+    let sample_rate_hz = params.sample_rate.unwrap_or(0);
+    let channels = params.channels.as_ref().map_or(0, |c| c.count() as u32);
+
+    let num_frames = track.num_frames.unwrap_or(0) as f64;
+    let duration_secs = match track.time_base {
+        Some(tb) => num_frames * tb.numer.get() as f64 / tb.denom.get() as f64,
+        None if sample_rate_hz > 0 => num_frames / sample_rate_hz as f64,
+        None => 0.0,
+    };
+
+    Some(AudioProbe {
+        duration_secs,
+        codec,
+        sample_rate_hz,
+        channels,
+    })
+}
+
+fn read_image_meta(path: &Path, with_hash: bool) -> Result<ImageMeta, CiteError> {
+    let size_bytes = std::fs::metadata(path)?.len();
+    let sha256 = if with_hash {
+        crate::core::cache::sha256_file(path)?
+    } else {
+        String::new()
+    };
+    let ext = lowercase_ext(path);
+    let format = match ext.as_str() {
+        "jpg" | "jpeg" => "jpeg".to_string(),
+        _ => ext,
+    };
+    let (width, height) = imagesize::size(path)
+        .map(|d| (d.width as u32, d.height as u32))
+        .unwrap_or((0, 0));
 
     Ok(ImageMeta {
         format,
@@ -190,18 +164,10 @@ pub fn extract_image(path: &Path) -> Result<ImageMeta, CiteError> {
     })
 }
 
-fn sha256_file(path: &Path) -> Result<String, CiteError> {
-    let bytes = std::fs::read(path)?;
-    let hash = Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    Ok(hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::cache::sha256_file;
 
     #[test]
     fn test_sha256_empty() {

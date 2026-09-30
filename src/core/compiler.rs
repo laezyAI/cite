@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use crate::core::cache::{UuidCache, hash_files};
 use crate::core::db::DbManager;
 use crate::core::media::{AudioMeta, ImageMeta, extract_audio, extract_image};
 use crate::core::metadata::{Podcast, TimelineEntry, TimelineItem};
-use crate::core::project::ProjectContext;
+use crate::core::project::{BuildRecord, ProjectContext};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentBundle {
@@ -60,9 +60,7 @@ pub enum CompileOutcome {
 impl CompileOutcome {
     pub fn emit(&self) {
         match self {
-            CompileOutcome::UpToDate => {
-                info!("Nothing to rebuild — all files up to date");
-            }
+            CompileOutcome::UpToDate => info!("Nothing to rebuild — all files up to date"),
             CompileOutcome::Complete { stats, artifact } => {
                 info!(
                     "Built {} podcast(s), {} timeline(s), {} words in {}ms{}",
@@ -89,163 +87,153 @@ pub async fn compile(
 ) -> Result<CompileOutcome, CiteError> {
     let start = Instant::now();
     let project_id = ctx.project_id();
-    let content_files = ctx.content_files();
+    let build = &ctx.manifest.build;
 
-    let current_hashes = hash_files(&content_files).await?;
+    let current_hashes = hash_files(ctx.content_files()).await?;
 
-    if !force
-        && let Ok(Some(cache)) = db.load_cache(&project_id).await
-        && cache.compiler_version == ctx.manifest.build.compiler_version
+    let cache = if force || !build.incremental {
+        None
+    } else {
+        db.load_cache(&project_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|c| c.compiler_version == build.compiler_version)
+    };
+    if let Some(cache) = &cache
+        && cache.changed_since(&current_hashes).is_empty()
     {
-        let changed = cache.changed_since(&current_hashes);
-        if changed.is_empty() {
-            info!("Nothing to rebuild — all files up to date");
-            return Ok(CompileOutcome::UpToDate);
-        }
+        return Ok(CompileOutcome::UpToDate);
     }
+    let was_incremental = cache.is_some();
 
     let mut uuid_cache = UuidCache::load(&ctx.root);
-    let bundle = build_bundle(ctx, &mut uuid_cache).await?;
+    let bundle = build_bundle(ctx, &project_id, &mut uuid_cache).await?;
     uuid_cache.save(&ctx.root);
 
     let build_dir = ctx.build_dir();
+    let artifact = build_dir.join("content.json");
     tokio::fs::create_dir_all(&build_dir).await?;
-    let json = serde_json::to_string_pretty(&bundle)?;
-    tokio::fs::write(build_dir.join("content.json"), json).await?;
+    tokio::fs::write(&artifact, serde_json::to_vec_pretty(&bundle)?).await?;
 
-    let elapsed = start.elapsed().as_millis() as i64;
+    let duration_ms = start.elapsed().as_millis() as i64;
     let total_words: i64 = bundle
         .podcasts
         .iter()
         .filter_map(|p| p.content.as_deref())
-        .flat_map(|c| c.split_whitespace())
-        .count() as i64;
-
+        .map(word_count)
+        .sum();
     let timeline_count = bundle
         .timelines
         .iter()
         .map(|t| t.entries.len() as i64)
         .sum();
 
-    let was_incremental = !force;
-
-    let cv = ctx.manifest.build.compiler_version;
+    // Local analytics are best-effort: a DB hiccup must not fail an otherwise good build.
     let _ = db.save_cache(&project_id, &current_hashes).await;
-    let _ = db.sync_project(ctx).await;
+    let _ = db.sync_project(ctx, &bundle).await;
     let _ = db
-        .record_build(&crate::core::project::BuildRecord {
-            project_id: project_id.clone(),
-            compiler_version: cv,
+        .record_build(&BuildRecord {
+            project_id,
+            compiler_version: build.compiler_version,
             podcast_count: bundle.podcasts.len() as i64,
             timeline_count,
             total_words,
-            duration_ms: elapsed,
+            duration_ms,
             was_incremental,
         })
         .await;
 
-    let stats = CompileStats {
-        podcasts: bundle.podcasts.len(),
-        timelines: bundle.timelines.len(),
-        total_words,
-        duration_ms: elapsed,
-        was_incremental,
-    };
-
     Ok(CompileOutcome::Complete {
-        artifact: build_dir.join("content.json"),
-        stats,
+        stats: CompileStats {
+            podcasts: bundle.podcasts.len(),
+            timelines: bundle.timelines.len(),
+            total_words,
+            duration_ms,
+            was_incremental,
+        },
+        artifact,
     })
+}
+
+pub fn word_count(content: &str) -> i64 {
+    content.split_whitespace().count() as i64
 }
 
 async fn build_bundle(
     ctx: &ProjectContext,
+    project_id: &str,
     uuid_cache: &mut UuidCache,
 ) -> Result<ContentBundle, CiteError> {
-    let mut podcasts = Vec::new();
+    let mut podcasts = Vec::with_capacity(ctx.metadata.podcasts.len());
     let mut timelines = Vec::new();
 
     for p in &ctx.metadata.podcasts {
-        let id = uuid_cache.get_or_create(&format!("podcast:{}:{}", ctx.project_id(), p.file));
-        let content = if !p.file.is_empty() {
-            let src = ctx.root.join(&p.file);
-            if src.exists() && src.is_file() {
-                Some(tokio::fs::read_to_string(&src).await?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let id = uuid_cache.get_or_create(&format!("podcast:{project_id}:{}", p.file));
+        let content = read_optional(&ctx.root.join(&p.file), !p.file.is_empty()).await?;
 
-        let audio_meta = if let Some(ref audio) = p.audio {
-            let path = ctx.root.join(audio);
-            if path.exists() {
-                extract_audio(&path).ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let thumbnail_meta = if let Some(ref thumb) = p.thumbnail {
-            let path = ctx.root.join(thumb);
-            if path.exists() {
-                extract_image(&path).ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        podcasts.push(BundlePodcast {
-            id: id.clone(),
-            podcast: p.clone(),
-            content,
-            audio_meta,
-            thumbnail_meta,
-        });
+        let audio_path = p.audio.as_ref().map(|a| ctx.root.join(a));
+        let thumb_path = p.thumbnail.as_ref().map(|t| ctx.root.join(t));
+        let (audio_meta, thumbnail_meta) = tokio::task::spawn_blocking(move || {
+            (
+                audio_path
+                    .filter(|p| p.is_file())
+                    .and_then(|p| extract_audio(&p).ok()),
+                thumb_path
+                    .filter(|p| p.is_file())
+                    .and_then(|p| extract_image(&p).ok()),
+            )
+        })
+        .await
+        .map_err(|e| CiteError::Config(format!("Media inspection failed: {e}")))?;
 
         for item in &p.timeline {
             let TimelineItem::Citation(citation) = item else {
                 continue;
             };
-            let bib_src = ctx.root.join(citation);
-            if bib_src.exists() {
-                let bib_content = tokio::fs::read_to_string(&bib_src).await?;
-                let entries = parse_bibtex(&bib_content);
-                if !entries.is_empty() {
-                    let tl_id = uuid_cache.get_or_create(&format!(
-                        "timeline:{}:{}",
-                        ctx.project_id(),
-                        citation
-                    ));
-                    let mut entries = entries;
-                    for (idx, entry) in entries.iter_mut().enumerate() {
-                        entry.id = format!("{tl_id}-{idx}");
-                    }
-                    timelines.push(BundleTimeline {
-                        id: tl_id,
-                        podcast_id: id.clone(),
-                        source: citation.clone(),
-                        entries,
-                    });
-                }
+            let Some(bib) = read_optional(&ctx.root.join(citation), true).await? else {
+                continue;
+            };
+            let mut entries = parse_bibtex(&bib);
+            if entries.is_empty() {
+                continue;
             }
+            let tl_id = uuid_cache.get_or_create(&format!("timeline:{project_id}:{citation}"));
+            for (idx, entry) in entries.iter_mut().enumerate() {
+                entry.id = format!("{tl_id}-{idx}");
+            }
+            timelines.push(BundleTimeline {
+                id: tl_id,
+                podcast_id: id.clone(),
+                source: citation.clone(),
+                entries,
+            });
         }
-    }
 
-    let artist_id = ctx.manifest.project.artist_id.clone();
+        podcasts.push(BundlePodcast {
+            id,
+            podcast: p.clone(),
+            content,
+            audio_meta,
+            thumbnail_meta,
+        });
+    }
 
     Ok(ContentBundle {
         compiler_version: ctx.manifest.build.compiler_version,
         project: ctx.manifest.project.name.clone(),
-        artist_id,
+        artist_id: ctx.manifest.project.artist_id.clone(),
         podcasts,
         timelines,
     })
+}
+
+/// Read a UTF-8 file if `enabled` and it exists; a missing file is not an error.
+async fn read_optional(path: &Path, enabled: bool) -> Result<Option<String>, CiteError> {
+    if !enabled || !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(tokio::fs::read_to_string(path).await?))
 }
 
 pub fn parse_bibtex(content: &str) -> Vec<TimelineEntry> {
@@ -322,14 +310,11 @@ pub fn parse_bibtex(content: &str) -> Vec<TimelineEntry> {
             .or_else(|| extract_bib_field(body, "doi"))
             .unwrap_or_default();
         let link = extract_bib_field(body, "link").filter(|l| !l.trim().is_empty());
-        let date = format_bib_date(&year, &month);
-        let entry_title = format_title(&title, &author);
-        let id = uuid::Uuid::new_v4().to_string();
-
         entries.push(TimelineEntry {
-            id,
-            date: Some(date),
-            title: entry_title,
+            // Stable ids are assigned by the compiler once the owning timeline is known.
+            id: String::new(),
+            date: Some(format_bib_date(&year, &month)),
+            title: format_title(&title, &author),
             summary: Some(summary),
             url: Some(url),
             link,
@@ -548,5 +533,74 @@ mod tests {
         let entries = parse_bibtex(bib);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].title.contains("Real Entry"));
+    }
+
+    #[test]
+    fn test_word_count() {
+        assert_eq!(word_count("one two  three\n"), 3);
+        assert_eq!(word_count(""), 0);
+    }
+
+    fn write_project(dir: &Path) -> ProjectContext {
+        std::fs::write(
+            dir.join("cite.toml"),
+            "[project]\nname = \"p\"\nartist_id = \"11111111-1111-1111-1111-111111111111\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("content")).unwrap();
+        std::fs::write(dir.join("content/ep.md"), "# Episode\nHello world").unwrap();
+        std::fs::write(
+            dir.join("content/ep.bib"),
+            "@article{a, title = {First}, year = {2020}}\n@article{b, title = {First}, year = {2021}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("metadata.yml"),
+            "podcasts:\n  - title: Ep\n    file: content/ep.md\n    timeline:\n      - content/ep.bib\n",
+        )
+        .unwrap();
+        ProjectContext::load(dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_compile_syncs_timelines_to_owning_podcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = write_project(dir.path());
+        let db = DbManager::open_path(&dir.path().join("test.db"))
+            .await
+            .unwrap();
+
+        let CompileOutcome::Complete { stats, .. } = compile(&db, &ctx, false).await.unwrap()
+        else {
+            panic!("first build must compile");
+        };
+        assert!(
+            !stats.was_incremental,
+            "no cache yet, so this is a full build"
+        );
+
+        // Duplicate BibTeX titles must not collide in the local snapshot.
+        let snapshot = db.get_restore_snapshot(&ctx.project_id()).await.unwrap();
+        assert_eq!(snapshot.podcasts.len(), 1);
+        assert_eq!(snapshot.timelines.len(), 2);
+        assert!(
+            snapshot
+                .timelines
+                .iter()
+                .all(|t| t.podcast_id == snapshot.podcasts[0].id),
+            "restored timelines must reference their podcast"
+        );
+
+        assert!(matches!(
+            compile(&db, &ctx, false).await.unwrap(),
+            CompileOutcome::UpToDate
+        ));
+
+        std::fs::write(dir.path().join("content/ep.md"), "# Episode\nChanged").unwrap();
+        let CompileOutcome::Complete { stats, .. } = compile(&db, &ctx, false).await.unwrap()
+        else {
+            panic!("changed content must recompile");
+        };
+        assert!(stats.was_incremental);
     }
 }

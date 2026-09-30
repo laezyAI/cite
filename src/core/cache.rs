@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,15 +46,12 @@ pub struct UuidCache {
 impl UuidCache {
     pub fn load(root: &Path) -> Self {
         let path = root.join(".cite").join("cache").join("uuid_map.json");
-        match std::fs::read_to_string(&path)
+        std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-        {
-            Some(m) => m,
-            None => Self {
+            .unwrap_or_else(|| Self {
                 mapping: HashMap::new(),
-            },
-        }
+            })
     }
 
     pub fn save(&self, root: &Path) {
@@ -75,20 +73,36 @@ impl UuidCache {
     }
 }
 
-pub async fn hash_files(files: &[impl AsRef<Path>]) -> Result<HashMap<String, String>, CiteError> {
-    let mut hashes = HashMap::new();
-    for file in files {
-        let path = file.as_ref();
-        if path.exists() && path.is_file() {
-            let buf = tokio::fs::read(path).await?;
-            let hash = Sha256::digest(&buf)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            hashes.insert(path.to_string_lossy().to_string(), hash);
+/// Hash every existing file in `files`, off the async runtime.
+pub async fn hash_files(files: Vec<PathBuf>) -> Result<HashMap<String, String>, CiteError> {
+    tokio::task::spawn_blocking(move || {
+        let mut hashes = HashMap::with_capacity(files.len());
+        for path in files {
+            if path.is_file() {
+                let hash = sha256_file(&path)?;
+                hashes.insert(path.to_string_lossy().into_owned(), hash);
+            }
         }
+        Ok(hashes)
+    })
+    .await
+    .map_err(|e| CiteError::Config(format!("Hashing task failed: {e}")))?
+}
+
+/// Streaming SHA-256 of a file as lowercase hex; never loads the whole file into memory.
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(to_hex(&hasher.finalize()))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
     }
-    Ok(hashes)
+    out
 }
 
 #[cfg(test)]
@@ -124,6 +138,29 @@ mod tests {
         current.insert("a.md".into(), "def".into());
         let changed = cache.changed_since(&current);
         assert_eq!(changed, vec!["a.md"]);
+    }
+
+    #[test]
+    fn test_sha256_file_known_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("hello.txt");
+        std::fs::write(&f, "hello").unwrap();
+        assert_eq!(
+            sha256_file(&f).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hash_files_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("a.md");
+        std::fs::write(&present, "a").unwrap();
+        let hashes = hash_files(vec![present.clone(), dir.path().join("missing.md")])
+            .await
+            .unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains_key(present.to_string_lossy().as_ref()));
     }
 
     #[test]

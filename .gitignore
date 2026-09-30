@@ -1,5 +1,5 @@
 /target
 build/
 .cite-cache.json
-cargo.lock
 .env
+.DS_Store

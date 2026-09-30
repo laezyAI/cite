@@ -144,7 +144,7 @@ impl ProjectContext {
         let manifest_path = root.join("cite.toml");
         if !manifest_path.exists() {
             return Err(CiteError::Config(format!(
-                "No cite.toml found at '{}'. Run 'cite-cli init' first.",
+                "No cite.toml found at '{}'. Run 'cite init' first.",
                 manifest_path.display()
             )));
         }

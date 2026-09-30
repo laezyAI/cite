@@ -5,15 +5,14 @@ use libsql::{Builder, Connection, Value, params};
 use tracing::info;
 
 use crate::core::CiteError;
-use crate::core::cache::{BuildCache, UuidCache};
+use crate::core::cache::BuildCache;
+use crate::core::compiler::{ContentBundle, word_count};
 use crate::core::project::ProjectContext;
 
 pub fn global_db_path() -> PathBuf {
-    if let Ok(path) = std::env::var("CITE_DB_PATH") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".cite").join("cite.db")
+    std::env::var_os("CITE_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::core::cite_home().join("cite.db"))
 }
 
 pub struct DbManager {
@@ -118,6 +117,10 @@ impl DbManager {
                 last_modified TEXT,
                 PRIMARY KEY (file_path, project_id)
             );
+            CREATE INDEX IF NOT EXISTS idx_podcasts_project ON podcasts (project_id);
+            CREATE INDEX IF NOT EXISTS idx_timeline_entries_project ON timeline_entries (project_id);
+            CREATE INDEX IF NOT EXISTS idx_build_history_project ON build_history (project_id, built_at);
+            CREATE INDEX IF NOT EXISTS idx_deployment_history_project ON deployment_history (project_id, deployed_at);
         ";
 
         for stmt in batch.split(';') {
@@ -156,141 +159,96 @@ impl DbManager {
         Ok(())
     }
 
-    async fn project_ensure(&self, project_id: &str, name: &str) -> Result<(), CiteError> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO projects (id, name, root_path, last_synced)
-                 VALUES (?1, ?2, '', strftime('%Y-%m-%dT%H:%M:%fZ', CURRENT_TIMESTAMP))",
-                params![project_id, name],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn project_update_sync(
+    /// Replace the local snapshot of a project with the freshly compiled bundle.
+    pub async fn sync_project(
         &self,
-        project_id: &str,
         ctx: &ProjectContext,
+        bundle: &ContentBundle,
     ) -> Result<(), CiteError> {
-        self.conn
-            .execute(
-                "UPDATE projects SET name = ?1, root_path = ?2, language = ?3, artist_id = ?4,
-                        metadata_file = ?5, last_synced = strftime('%Y-%m-%dT%H:%M:%fZ', CURRENT_TIMESTAMP)
-                 WHERE id = ?6",
+        let project_id = ctx.project_id();
+        let project = &ctx.manifest.project;
+
+        let tx = self.conn.transaction().await?;
+        tx.execute(
+            "INSERT INTO projects (id, name, root_path, language, artist_id, metadata_file, last_synced)
+             VALUES (?1, ?2, ?1, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', CURRENT_TIMESTAMP))
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                root_path = excluded.root_path,
+                language = excluded.language,
+                artist_id = excluded.artist_id,
+                metadata_file = excluded.metadata_file,
+                last_synced = excluded.last_synced",
+            params![
+                project_id.as_str(),
+                project.name.as_str(),
+                project.language.as_str(),
+                project.artist_id.as_str(),
+                project.metadata_file.as_str(),
+            ],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM podcasts WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM timeline_entries WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )
+        .await?;
+
+        for pod in &bundle.podcasts {
+            let meta = &pod.podcast;
+            tx.execute(
+                "INSERT INTO podcasts (id, project_id, title, file, source_url, category,
+                        thumbnail, audio, citation_file, content, word_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
-                    ctx.manifest.project.name.clone(),
-                    ctx.root.to_string_lossy().to_string(),
-                    ctx.manifest.project.language.clone(),
-                    ctx.manifest.project.artist_id.clone(),
-                    ctx.manifest.project.metadata_file.clone(),
-                    project_id,
+                    pod.id.as_str(),
+                    project_id.as_str(),
+                    meta.title.as_str(),
+                    meta.file.as_str(),
+                    meta.source_url.as_deref(),
+                    meta.category.as_deref(),
+                    meta.thumbnail.as_deref(),
+                    meta.audio.as_deref(),
+                    meta.citation(),
+                    pod.content.as_deref(),
+                    pod.content.as_deref().map_or(0, word_count),
                 ],
             )
             .await?;
-        Ok(())
-    }
+        }
 
-    pub async fn sync_project(&self, ctx: &ProjectContext) -> Result<(), CiteError> {
-        let project_id = ctx.root.to_string_lossy().to_string();
-        let name = &ctx.manifest.project.name;
-
-        self.project_ensure(&project_id, name).await?;
-        self.project_update_sync(&project_id, ctx).await?;
-
-        self.conn
-            .execute(
-                "DELETE FROM podcasts WHERE project_id = ?1",
-                params![project_id.clone()],
-            )
-            .await?;
-        self.conn
-            .execute(
-                "DELETE FROM timeline_entries WHERE project_id = ?1",
-                params![project_id.clone()],
-            )
-            .await?;
-
-        let mut uuid_cache = UuidCache::load(&ctx.root);
-
-        for pod in &ctx.metadata.podcasts {
-            let content = read_content_file(&ctx.root.join(&pod.file));
-            let wc = content
-                .as_deref()
-                .map(|c| c.split_whitespace().count() as i64)
-                .unwrap_or(0);
-
-            let pod_id = uuid_cache.get_or_create(&format!("podcast:{}:{}", project_id, pod.file));
-
-            self.conn
-                .execute(
-                    "INSERT INTO podcasts (id, project_id, title, file, source_url, category,
-                            thumbnail, audio, citation_file, content, word_count)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        for timeline in &bundle.timelines {
+            for entry in &timeline.entries {
+                tx.execute(
+                    "INSERT INTO timeline_entries
+                        (id, project_id, podcast_id, date, title, summary, url, link)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
-                        pod_id,
-                        project_id.clone(),
-                        pod.title.clone(),
-                        pod.file.clone(),
-                        pod.source_url.clone(),
-                        pod.category.clone(),
-                        pod.thumbnail.clone(),
-                        pod.audio.clone(),
-                        pod.citation().map(str::to_string),
-                        content,
-                        wc,
+                        entry.id.as_str(),
+                        project_id.as_str(),
+                        timeline.podcast_id.as_str(),
+                        entry.date.as_deref(),
+                        entry.title.as_str(),
+                        entry.summary.as_deref(),
+                        entry.url.as_deref(),
+                        entry.link.as_deref(),
                     ],
                 )
                 .await?;
-        }
-
-        for pod in &ctx.metadata.podcasts {
-            if let Some(cit) = pod.citation() {
-                let bib_path = ctx.root.join(cit);
-                if bib_path.exists()
-                    && let Ok(raw) = std::fs::read_to_string(&bib_path)
-                {
-                    let entries = crate::core::compiler::parse_bibtex(&raw);
-                    let tl_id =
-                        uuid_cache.get_or_create(&format!("timeline:{}:{}", project_id, cit));
-                    for entry in &entries {
-                        let entry_id =
-                            uuid_cache.get_or_create(&format!("entry:{}:{}", tl_id, entry.title));
-                        let none_str: Option<String> = None;
-                        let tl_id_param = tl_id.clone();
-                        let entry_date = entry.date.clone();
-                        let entry_title = entry.title.clone();
-                        let entry_summary = entry.summary.clone();
-                        let entry_url = entry.url.clone();
-                        let entry_link = entry.link.clone();
-                        self.conn
-                                .execute(
-                                    "INSERT INTO timeline_entries
-                                        (id, project_id, podcast_id, date, title, summary, url, link, entry_type)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                                    params![
-                                        entry_id,
-                                        project_id.clone(),
-                                        tl_id_param,
-                                        entry_date,
-                                        entry_title,
-                                        entry_summary,
-                                        entry_url,
-                                        entry_link,
-                                        none_str,
-                                    ],
-                                )
-                                .await?;
-                    }
-                }
             }
         }
-
-        uuid_cache.save(&ctx.root);
+        tx.commit().await?;
 
         info!(
-            "Synced {} podcast(s) and timeline entries for '{}'",
-            ctx.metadata.podcasts.len(),
-            name
+            "Synced {} podcast(s) and {} timeline group(s) for '{}'",
+            bundle.podcasts.len(),
+            bundle.timelines.len(),
+            project.name
         );
         Ok(())
     }
@@ -335,25 +293,23 @@ impl DbManager {
         project_id: &str,
         hashes: &HashMap<String, String>,
     ) -> Result<(), CiteError> {
-        self.conn
-            .execute(
-                "DELETE FROM file_cache WHERE project_id = ?1",
-                params![project_id],
-            )
-            .await?;
+        let tx = self.conn.transaction().await?;
+        tx.execute(
+            "DELETE FROM file_cache WHERE project_id = ?1",
+            params![project_id],
+        )
+        .await?;
 
         let now = chrono::Utc::now().to_rfc3339();
-
         for (path, hash) in hashes {
-            self.conn
-                .execute(
-                    "INSERT INTO file_cache (file_path, project_id, sha256, last_modified)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![path.clone(), project_id, hash.clone(), now.clone()],
-                )
-                .await?;
+            tx.execute(
+                "INSERT INTO file_cache (file_path, project_id, sha256, last_modified)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![path.as_str(), project_id, hash.as_str(), now.as_str()],
+            )
+            .await?;
         }
-
+        tx.commit().await?;
         Ok(())
     }
 
@@ -465,16 +421,12 @@ impl DbManager {
 
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {
-            let d = get_opt_string(&row, 0);
-            let u = get_opt_string(&row, 2);
-            let t = get_opt_string(&row, 3);
-            let l = get_opt_string(&row, 4);
             entries.push(super::project::StoredTimeline {
-                date: if d.is_empty() { None } else { Some(d) },
+                date: opt_string(&row, 0),
                 title: row.get(1)?,
-                url: if u.is_empty() { None } else { Some(u) },
-                entry_type: if t.is_empty() { None } else { Some(t) },
-                link: if l.is_empty() { None } else { Some(l) },
+                url: opt_string(&row, 2),
+                entry_type: opt_string(&row, 3),
+                link: opt_string(&row, 4),
             });
         }
         Ok(entries)
@@ -618,104 +570,33 @@ impl DbManager {
         &self,
         project_id: &str,
     ) -> Result<super::project::ProjectStats, CiteError> {
-        let podcast_count: i64 = self
+        let mut rows = self
             .conn
             .query(
-                "SELECT COUNT(*) FROM podcasts WHERE project_id = ?1",
+                "SELECT
+                    (SELECT COUNT(*) FROM podcasts WHERE project_id = ?1),
+                    (SELECT COUNT(*) FROM timeline_entries WHERE project_id = ?1),
+                    (SELECT COALESCE(SUM(word_count), 0) FROM podcasts WHERE project_id = ?1),
+                    (SELECT COUNT(*) FROM build_history WHERE project_id = ?1),
+                    (SELECT MAX(built_at) FROM build_history WHERE project_id = ?1),
+                    (SELECT COUNT(*) FROM deployment_history WHERE project_id = ?1 AND success = 1),
+                    (SELECT MAX(deployed_at) FROM deployment_history WHERE project_id = ?1 AND success = 1)",
                 params![project_id],
             )
-            .await?
+            .await?;
+        let row = rows
             .next()
             .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let timeline_count: i64 = self
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM timeline_entries WHERE project_id = ?1",
-                params![project_id],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let total_words: i64 = self
-            .conn
-            .query(
-                "SELECT COALESCE(SUM(word_count), 0) FROM podcasts WHERE project_id = ?1",
-                params![project_id],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let build_count: i64 = self
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM build_history WHERE project_id = ?1",
-                params![project_id],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let last_built: Option<String> = self
-            .conn
-            .query(
-                "SELECT built_at FROM build_history WHERE project_id = ?1 ORDER BY built_at DESC LIMIT 1",
-                params![project_id],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| {
-                let s: String = row.get(0).unwrap_or_default();
-                s
-            })
-            .filter(|s| !s.is_empty());
-
-        let deployment_count: i64 = self
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM deployment_history WHERE project_id = ?1 AND success = 1",
-                params![project_id],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let last_deployed: Option<String> = self
-            .conn
-            .query(
-                "SELECT deployed_at FROM deployment_history WHERE project_id = ?1 AND success = 1 ORDER BY deployed_at DESC LIMIT 1",
-                params![project_id],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| {
-                let s: String = row.get(0).unwrap_or_default();
-                s
-            })
-            .filter(|s| !s.is_empty());
+            .ok_or_else(|| CiteError::Database("Project stats query returned no row".into()))?;
 
         Ok(super::project::ProjectStats {
-            podcast_count,
-            timeline_count,
-            total_words,
-            build_count,
-            last_built,
-            deployment_count,
-            last_deployed,
+            podcast_count: row.get(0)?,
+            timeline_count: row.get(1)?,
+            total_words: row.get(2)?,
+            build_count: row.get(3)?,
+            last_built: opt_string(&row, 4),
+            deployment_count: row.get(5)?,
+            last_deployed: opt_string(&row, 6),
         })
     }
 
@@ -734,66 +615,30 @@ impl DbManager {
     }
 
     pub async fn get_all_stats(&self) -> Result<super::project::AllStats, CiteError> {
-        let project_count: i64 = self
+        let mut rows = self
             .conn
-            .query("SELECT COUNT(*) FROM projects", ())
-            .await?
+            .query(
+                "SELECT
+                    (SELECT COUNT(*) FROM projects),
+                    (SELECT COUNT(*) FROM podcasts),
+                    (SELECT COUNT(*) FROM timeline_entries),
+                    (SELECT COALESCE(SUM(word_count), 0) FROM podcasts),
+                    (SELECT COUNT(*) FROM build_history)",
+                (),
+            )
+            .await?;
+        let row = rows
             .next()
             .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let total_podcasts: i64 = self
-            .conn
-            .query("SELECT COUNT(*) FROM podcasts", ())
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let total_timelines: i64 = self
-            .conn
-            .query("SELECT COUNT(*) FROM timeline_entries", ())
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let total_words: i64 = self
-            .conn
-            .query("SELECT COALESCE(SUM(word_count), 0) FROM podcasts", ())
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
-
-        let total_builds: i64 = self
-            .conn
-            .query("SELECT COUNT(*) FROM build_history", ())
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0).unwrap_or(0))
-            .unwrap_or(0);
+            .ok_or_else(|| CiteError::Database("Global stats query returned no row".into()))?;
 
         Ok(super::project::AllStats {
-            project_count,
-            total_podcasts,
-            total_timelines,
-            total_words,
-            total_builds,
+            project_count: row.get(0)?,
+            total_podcasts: row.get(1)?,
+            total_timelines: row.get(2)?,
+            total_words: row.get(3)?,
+            total_builds: row.get(4)?,
         })
-    }
-}
-
-fn read_content_file(path: &Path) -> Option<String> {
-    if path.exists() && path.is_file() {
-        std::fs::read_to_string(path).ok()
-    } else {
-        None
     }
 }
 

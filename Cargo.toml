@@ -1,8 +1,12 @@
 [package]
-name = "cite-cli"
-version = "0.1.0-alpha.4"
+name = "cite"
+version = "0.1.0-alpha.5"
 edition = "2024"
-repository = "https://github.com/VinayIN/cite-cli"
+description = "Create, validate, build, and deploy podcast content to Supabase"
+license = "MIT"
+repository = "https://github.com/laezyAI/cite"
+homepage = "https://github.com/laezyAI/cite"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }

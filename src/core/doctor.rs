@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use tracing::{error, info, warn};
@@ -151,18 +151,18 @@ pub async fn run(db: &DbManager, ctx: &ProjectContext) -> Result<DoctorOutcome, 
     {
         info!("Backend configured for staging");
     } else {
-        let msg =
+        outcome.push_warning(
             "No backend configured in cite.toml — deploy will use credentials file or env vars"
-                .to_string();
-        warn!("{msg}");
-        outcome.push_warning(msg);
+                .to_string(),
+        );
     }
 
     if ctx.root.join("cite.toml").exists() {
         info!("cite.toml found");
     }
-    if ctx.root.join("metadata.yml").exists() {
-        info!("metadata.yml found");
+    let metadata_file = &ctx.manifest.project.metadata_file;
+    if ctx.root.join(metadata_file).exists() {
+        info!("{metadata_file} found");
     }
 
     for dir in &["content", "assets/audio", "assets/image", "build"] {
@@ -181,9 +181,7 @@ pub async fn run(db: &DbManager, ctx: &ProjectContext) -> Result<DoctorOutcome, 
     }
 
     if ctx.manifest.project.artist_id.is_empty() {
-        let msg = "Artist ID is empty — set it in [project] in cite.toml".to_string();
-        warn!("{msg}");
-        outcome.push_warning(msg);
+        outcome.push_warning("Artist ID is empty — set it in [project] in cite.toml".to_string());
     } else {
         info!("Artist ID: {}", ctx.manifest.project.artist_id);
     }
@@ -484,7 +482,7 @@ fn validate_images(ctx: &ProjectContext, errors: &mut Vec<String>, _warnings: &m
             ));
         }
 
-        if let Ok(meta) = crate::core::media::extract_image(&path)
+        if let Ok(meta) = crate::core::media::inspect_image(&path)
             && meta.width > 0
             && meta.height > 0
             && (meta.width < 100 || meta.height < 100)
@@ -552,9 +550,9 @@ fn validate_urls(ctx: &ProjectContext, errors: &mut Vec<String>, warnings: &mut 
                 && !url.starts_with("cite://")
             {
                 errors.push(format!(
-                        "Podcast '{}' has invalid source_url: '{url}' (must start with http://, https://, or cite://)",
-                        pod.title
-                    ));
+                    "Podcast '{}' has invalid source_url: '{url}' (must start with http://, https://, or cite://)",
+                    pod.title
+                ));
             }
             if !urls.insert(url.clone()) {
                 warnings.push(format!(
@@ -596,14 +594,7 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
         };
 
         let word_count = content_str.split_whitespace().count();
-        let reading_time = (word_count as f64 / 200.0).ceil() as u64;
-        let content_copy = content_str.clone();
-        let lines: Vec<&str> = content_str
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-
-        all_content.push((pod.title.clone(), content_copy, word_count, reading_time));
+        let reading_time = word_count.div_ceil(200);
 
         if word_count < 100 {
             warnings.push(format!(
@@ -618,23 +609,15 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
             ));
         }
 
-        if reading_time > 0 {
-            if reading_time < 1 {
-                warnings.push(format!(
-                    "Podcast '{}' reading time is less than 1 minute",
-                    pod.title
-                ));
-            }
-            if reading_time > 120 {
-                warnings.push(format!(
-                    "Podcast '{}' reading time is over 2 hours",
-                    pod.title
-                ));
-            }
+        if reading_time > 120 {
+            warnings.push(format!(
+                "Podcast '{}' reading time is over 2 hours",
+                pod.title
+            ));
         }
 
-        let has_h1 = lines.iter().any(|l| l.starts_with("# "));
-        let has_h2 = lines.iter().any(|l| l.starts_with("## "));
+        let has_h1 = content_str.lines().any(|l| l.starts_with("# "));
+        let has_h2 = content_str.lines().any(|l| l.starts_with("## "));
         if !has_h1 && !has_h2 {
             warnings.push(format!("Podcast '{}' has no H1 or H2 headings", pod.title));
         } else if !has_h1 {
@@ -644,21 +627,18 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
             ));
         }
 
-        let paragraphs: Vec<&str> = content_str
+        let (paragraph_count, short_paras) = content_str
             .split("\n\n")
-            .map(|p| p.trim())
+            .map(str::trim)
             .filter(|p| !p.is_empty())
-            .collect();
-        let short_paras: Vec<&str> = paragraphs
-            .iter()
-            .filter(|p| p.split_whitespace().count() < 20)
-            .copied()
-            .collect();
-        if !short_paras.is_empty() && paragraphs.len() > 1 {
+            .fold((0usize, 0usize), |(total, short), p| {
+                let is_short = p.split_whitespace().count() < 20;
+                (total + 1, short + usize::from(is_short))
+            });
+        if short_paras > 0 && paragraph_count > 1 {
             warnings.push(format!(
-                "Podcast '{}' has {} short paragraph(s) (< 20 words) — consider expanding",
-                pod.title,
-                short_paras.len()
+                "Podcast '{}' has {short_paras} short paragraph(s) (< 20 words) — consider expanding",
+                pod.title
             ));
         }
 
@@ -678,7 +658,7 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
             if audio_path.exists() {
                 infos.push(format!("Podcast '{}' has audio file: {}", pod.title, audio));
 
-                if let Ok(meta) = crate::core::media::extract_audio(&audio_path) {
+                if let Ok(meta) = crate::core::media::inspect_audio(&audio_path) {
                     audio_durations.push(meta.duration_secs);
                     audio_formats.push(meta.format.clone());
                     sample_rates.push(meta.sample_rate_hz);
@@ -730,7 +710,7 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
         if let Some(ref thumb) = pod.thumbnail {
             let thumb_path = ctx.root.join(thumb);
             if thumb_path.exists()
-                && let Ok(meta) = crate::core::media::extract_image(&thumb_path)
+                && let Ok(meta) = crate::core::media::inspect_image(&thumb_path)
             {
                 image_sizes.push((meta.width, meta.height, meta.size_bytes));
 
@@ -742,9 +722,9 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
                 }
                 if meta.width > 8000 || meta.height > 8000 {
                     warnings.push(format!(
-                            "Podcast '{}' thumbnail is very large ({}x{}) — maximum 8000x8000 recommended",
-                            pod.title, meta.width, meta.height
-                        ));
+                        "Podcast '{}' thumbnail is very large ({}x{}) — maximum 8000x8000 recommended",
+                        pod.title, meta.width, meta.height
+                    ));
                 }
 
                 if meta.size_bytes > 3 * 1024 * 1024 {
@@ -756,6 +736,8 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
                 }
             }
         }
+
+        all_content.push((&pod.title, content_str));
     }
 
     // Cross-podcast lint checks
@@ -801,20 +783,28 @@ pub fn lint_all(ctx: &ProjectContext) -> DoctorOutcome {
         }
     }
 
-    // Detect duplicate paragraphs
-    for i in 0..all_content.len() {
-        let paras_i: Vec<&str> = all_content[i].1.split("\n\n").collect();
-        for j in (i + 1)..all_content.len() {
-            let paras_j: Vec<&str> = all_content[j].1.split("\n\n").collect();
-            for (pi, p) in paras_i.iter().enumerate() {
-                let trimmed = p.trim();
-                if trimmed.len() > 20 && paras_j.iter().any(|pj| pj.trim() == trimmed) {
-                    warnings.push(format!(
-                        "Duplicate paragraph found in '{}' and '{}' (paragraph {})",
-                        all_content[i].0,
-                        all_content[j].0,
-                        pi + 1
-                    ));
+    // Detect paragraphs repeated across podcasts (single pass, hashed by paragraph text)
+    let mut first_seen: HashMap<&str, usize> = HashMap::new();
+    for (idx, (title, content)) in all_content.iter().enumerate() {
+        let mut reported = HashSet::new();
+        for (pi, para) in content.split("\n\n").enumerate() {
+            let trimmed = para.trim();
+            if trimmed.len() <= 20 {
+                continue;
+            }
+            match first_seen.get(trimmed) {
+                Some(&owner) if owner != idx => {
+                    if reported.insert(trimmed) {
+                        warnings.push(format!(
+                            "Duplicate paragraph found in '{}' and '{title}' (paragraph {})",
+                            all_content[owner].0,
+                            pi + 1
+                        ));
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    first_seen.insert(trimmed, idx);
                 }
             }
         }

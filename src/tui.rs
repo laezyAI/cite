@@ -35,6 +35,9 @@ const READY: Color = Color::Green;
 const MUTED: Color = Color::DarkGray;
 const ON_ACCENT: Color = Color::Black;
 
+/// Oldest log lines are dropped past this cap so long sessions don't grow without bound.
+const MAX_LOG_LINES: usize = 5_000;
+
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -421,6 +424,19 @@ impl AppState {
         match self.mode {
             TuiMode::Runner => self.handle_runner_key(key).await,
             TuiMode::CommandPalette => self.handle_command_palette_key(key),
+        }
+    }
+
+    fn push_log(&mut self, line: String) {
+        let was_at_bottom = self.scroll >= self.log.len().saturating_sub(1);
+        if self.log.len() >= MAX_LOG_LINES {
+            let overflow = self.log.len() + 1 - MAX_LOG_LINES;
+            self.log.drain(..overflow);
+            self.scroll = self.scroll.saturating_sub(overflow);
+        }
+        self.log.push(line);
+        if was_at_bottom {
+            self.scroll = self.log.len() - 1;
         }
     }
 
@@ -1057,13 +1073,7 @@ pub async fn run_tui(
                     }
                 }
             }
-            Some(line) = log_rx.recv() => {
-                let was_at_bottom = app.scroll >= app.log.len().saturating_sub(1);
-                app.log.push(line);
-                if was_at_bottom || app.log.len() <= 1 {
-                    app.scroll = app.log.len().saturating_sub(1);
-                }
-            }
+            Some(line) = log_rx.recv() => app.push_log(line),
             Some(Ok(event)) = events.next() => {
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
@@ -1778,10 +1788,12 @@ async fn edit_file(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> std:
     Ok(())
 }
 
-async fn file_digest(path: &Path) -> Option<[u8; 32]> {
-    use sha2::Digest;
-    let bytes = tokio::fs::read(path).await.ok()?;
-    Some(sha2::Sha256::digest(&bytes).into())
+async fn file_digest(path: &Path) -> Option<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::core::cache::sha256_file(&path).ok())
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn load_project_context(root: Option<PathBuf>) -> Option<(ProjectContext, DbManager)> {

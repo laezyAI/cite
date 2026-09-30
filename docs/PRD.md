@@ -1,6 +1,6 @@
 ## 1. Product Overview
 
-**cite-cli** is a production-grade CLI tool for creating, validating, building, and deploying podcast content to a Supabase backend consumed by the aouxAI application.
+**cite** is a production-grade CLI tool for creating, validating, building, and deploying podcast content to a Supabase backend consumed by the aouxAI application.
 
 The CLI manages the complete content lifecycle:
 
@@ -314,7 +314,7 @@ This structure is fixed. A local database at `~/.cite/cite.db` stores analytics,
 
 # 9. Local Analytics Database
 
-cite-cli maintains a local database at `~/.cite/cite.db` for offline analytics, caching, and history. The database is created on first run and updated by `build` and `deploy` commands.
+cite maintains a local database at `~/.cite/cite.db` for offline analytics, caching, and history. The database is created on first run and updated by `build` and `deploy` commands.
 
 Database schema is initialized on first run and migrated automatically on CLI upgrades.
 
@@ -416,7 +416,7 @@ Provides:
 
 # 11. Interactive Terminal UI
 
-Running `cite-cli` with no arguments (or `--tui` flag) opens a ratatui-based interface.
+Running `cite` with no arguments (or `--tui` flag) opens a ratatui-based interface.
 
 3 column Layout:
 
@@ -565,7 +565,7 @@ Analyzes content and media quality. Lint warnings do not block builds but should
 
 ### Login Flow
 
-`cite-cli login` prompts for:
+`cite login` prompts for:
 
 - Supabase project URL
 - Supabase API key (public/anon key)
@@ -583,7 +583,7 @@ Alternatively, credentials can be provided via environment variables:
 ```bash
 CITE_SUPABASE_URL="https://your-project.supabase.co"
 CITE_SUPABASE_API_KEY="eyJhbG..."
-cite-cli deploy
+cite deploy
 ```
 
 Credentials are never stored in `cite.toml` or project directories.
@@ -609,7 +609,7 @@ Credentials are never stored in `cite.toml` or project directories.
 
 # 16. Reliability Requirements
 
-cite-cli provides:
+cite provides:
 
 - deterministic compiler output (byte-for-byte identical builds)
 - persistent UUID assignment (podcast UUIDs survive rebuild/redeploy)

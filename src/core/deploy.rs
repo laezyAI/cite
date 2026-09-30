@@ -9,12 +9,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::core::CiteError;
-use crate::core::compiler::{BundlePodcast, BundleTimeline};
+use crate::core::compiler::{BundlePodcast, BundleTimeline, ContentBundle, word_count};
 use crate::core::credentials;
 use crate::core::db::DbManager;
 use crate::core::manifest::BackendConfig;
 use crate::core::metadata::{TimelineEntry, TimelineItem};
-use crate::core::project::ProjectContext;
+use crate::core::project::{DeployReport, ProjectContext};
 
 const ASSETS_BUCKET: &str = "assets";
 const PODCASTS_BUCKET: &str = "podcasts";
@@ -64,6 +64,14 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+fn base_url(backend: &BackendConfig) -> &str {
+    backend
+        .staging_url
+        .as_deref()
+        .unwrap_or_default()
+        .trim_end_matches('/')
+}
+
 fn build_context(
     ctx: &ProjectContext,
     backend: &BackendConfig,
@@ -71,12 +79,7 @@ fn build_context(
     let session = load_session();
     Ok(DeployContext {
         client: reqwest::Client::new(),
-        base_url: backend
-            .staging_url
-            .as_deref()
-            .unwrap_or_default()
-            .trim_end_matches('/')
-            .to_string(),
+        base_url: base_url(backend).to_string(),
         api_key: backend.staging_service_key.clone().unwrap_or_default(),
         bearer: resolve_bearer(backend, session.as_ref())?,
         root: ctx.root.clone(),
@@ -97,65 +100,64 @@ async fn ensure_success(
     )))
 }
 
+async fn load_bundle(ctx: &ProjectContext) -> Result<ContentBundle, CiteError> {
+    let bundle_path = ctx.build_dir().join("content.json");
+    let bundle_str = match tokio::fs::read_to_string(&bundle_path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CiteError::Config(
+                "No build artifact found. Run 'cite build' first.".to_string(),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(serde_json::from_str(&bundle_str)?)
+}
+
 pub async fn deploy(
     db: &DbManager,
     ctx: &ProjectContext,
     dry_run: bool,
 ) -> Result<String, CiteError> {
     let backend = resolve_backend_config(ctx)?;
-
-    let bundle_path = ctx.build_dir().join("content.json");
-    if !bundle_path.exists() {
-        return Err(CiteError::Config(
-            "No build artifact found. Run 'cite-cli build' first.".to_string(),
-        ));
-    }
-    let bundle_str = tokio::fs::read_to_string(&bundle_path).await?;
-    let bundle: crate::core::compiler::ContentBundle = serde_json::from_str(&bundle_str)?;
+    let bundle = load_bundle(ctx).await?;
     let deployment_id = Uuid::new_v4().to_string();
-    let project_name = bundle.project.clone();
-    let podcasts = bundle.podcasts.clone();
-    let timelines = bundle.timelines.clone();
-    let artist_id = bundle.artist_id.trim().to_string();
+    let artist_id = bundle.artist_id.trim();
 
     info!("Deploying: {deployment_id}");
 
     if dry_run {
         warn!("DRY RUN - no data will be sent");
-        info!("Podcast items: {}", podcasts.len());
-        info!("Timeline groups: {}", timelines.len());
+        info!("Podcast items: {}", bundle.podcasts.len());
+        info!("Timeline groups: {}", bundle.timelines.len());
         if !artist_id.is_empty() {
             info!("Artist ID: {artist_id}");
         }
-
-        let project_id = ctx.project_id();
         let _ = db
-            .record_deployment(&crate::core::project::DeployReport {
-                project_id: project_id.clone(),
-                deployment_id: deployment_id.clone(),
-                storage_path: "".to_string(),
-                news_count: podcasts.len() as i64,
-                timeline_count: timelines.len() as i64,
+            .record_deployment(&DeployReport {
+                project_id: ctx.project_id(),
+                deployment_id,
+                storage_path: String::new(),
+                news_count: bundle.podcasts.len() as i64,
+                timeline_count: bundle.timelines.len() as i64,
                 asset_count: 0,
                 success: true,
                 dry_run: true,
             })
             .await;
-
         return Ok("Dry run complete".to_string());
     }
 
-    let artist_id = Uuid::parse_str(&artist_id).map_err(|_| {
+    let artist_id = Uuid::parse_str(artist_id).map_err(|_| {
         CiteError::Config("artist_id in content.json must be a valid UUID".to_string())
     })?;
     let dctx = build_context(ctx, &backend)?;
-    let object_path = format!("{artist_id}/{project_name}/{deployment_id}.json");
+    let object_path = format!("{artist_id}/{}/{deployment_id}.json", bundle.project);
     let storage_path = format!("{ASSETS_BUCKET}/{object_path}");
-    let bundle_json = serde_json::to_vec_pretty(&bundle)?;
 
     let mut record = DeploymentRecord {
-        deployment_id: deployment_id.clone(),
-        storage_path: storage_path.clone(),
+        deployment_id,
+        storage_path,
         news_ids: Vec::new(),
         timeline_ids: Vec::new(),
         asset_paths: Vec::new(),
@@ -164,8 +166,9 @@ pub async fn deploy(
     ensure_artist_exists(&dctx, artist_id).await?;
     let categories = fetch_categories(&dctx).await?;
 
-    for pod in &podcasts {
-        let pod_groups: Vec<&BundleTimeline> = timelines
+    for pod in &bundle.podcasts {
+        let pod_groups: Vec<&BundleTimeline> = bundle
+            .timelines
             .iter()
             .filter(|tl| tl.podcast_id == pod.id)
             .collect();
@@ -177,13 +180,14 @@ pub async fn deploy(
             }
             Err(e) => {
                 warn!("Deploy failed partway: {e}");
-                record_partial(db, ctx, &record, &storage_path).await;
+                record_deployment(db, ctx, &record, false).await;
                 persist_deployment_record(ctx, &record).await?;
                 return Err(e);
             }
         }
     }
 
+    let bundle_json = serde_json::to_vec_pretty(&bundle)?;
     upload_bytes(
         &dctx,
         ASSETS_BUCKET,
@@ -192,48 +196,34 @@ pub async fn deploy(
         "application/json",
     )
     .await?;
-    info!("Uploaded bundle to {storage_path}");
+    info!("Uploaded bundle to {}", record.storage_path);
 
     persist_deployment_record(ctx, &record).await?;
-
-    let podcast_count = record.news_ids.len() as i64;
-    let timeline_count = record.timeline_ids.len() as i64;
-    let asset_count = record.asset_paths.len() as i64;
-
-    let project_id = ctx.project_id();
-    let _ = db
-        .record_deployment(&crate::core::project::DeployReport {
-            project_id: project_id.clone(),
-            deployment_id: deployment_id.clone(),
-            storage_path: storage_path.clone(),
-            news_count: podcast_count,
-            timeline_count,
-            asset_count,
-            success: true,
-            dry_run: false,
-        })
-        .await;
+    record_deployment(db, ctx, &record, true).await;
 
     Ok(format!(
-        "Deployed {podcast_count} podcast(s), {timeline_count} timeline(s), {asset_count} asset(s)"
+        "Deployed {} podcast(s), {} timeline(s), {} asset(s)",
+        record.news_ids.len(),
+        record.timeline_ids.len(),
+        record.asset_paths.len()
     ))
 }
 
-async fn record_partial(
+async fn record_deployment(
     db: &DbManager,
     ctx: &ProjectContext,
     record: &DeploymentRecord,
-    storage_path: &str,
+    success: bool,
 ) {
     let _ = db
-        .record_deployment(&crate::core::project::DeployReport {
+        .record_deployment(&DeployReport {
             project_id: ctx.project_id(),
             deployment_id: record.deployment_id.clone(),
-            storage_path: storage_path.to_string(),
+            storage_path: record.storage_path.clone(),
             news_count: record.news_ids.len() as i64,
             timeline_count: record.timeline_ids.len() as i64,
             asset_count: record.asset_paths.len() as i64,
-            success: false,
+            success,
             dry_run: false,
         })
         .await;
@@ -244,26 +234,21 @@ pub async fn deploy_staging(
     ctx: &ProjectContext,
     dry_run: bool,
 ) -> Result<String, CiteError> {
-    let bundle_path = ctx.build_dir().join("content.json");
-    if !bundle_path.exists() {
-        return Err(CiteError::Config(
-            "No build artifact found. Run 'cite-cli build' first.".to_string(),
-        ));
-    }
-    let bundle_str = tokio::fs::read_to_string(&bundle_path).await?;
-    let bundle: crate::core::compiler::ContentBundle = serde_json::from_str(&bundle_str)?;
+    let bundle = load_bundle(ctx).await?;
     let deployment_id = Uuid::new_v4().to_string();
     let podcasts = bundle.podcasts.len() as i64;
     let timelines = bundle.timelines.len() as i64;
 
     info!("Staging deployment: {deployment_id}");
 
-    let _ = db.sync_project(ctx).await;
+    if !dry_run {
+        db.sync_project(ctx, &bundle).await?;
+    }
     let _ = db
-        .record_deployment(&crate::core::project::DeployReport {
+        .record_deployment(&DeployReport {
             project_id: ctx.project_id(),
             deployment_id: deployment_id.clone(),
-            storage_path: "".to_string(),
+            storage_path: String::new(),
             news_count: podcasts,
             timeline_count: timelines,
             asset_count: 0,
@@ -272,23 +257,22 @@ pub async fn deploy_staging(
         })
         .await;
 
-    // Persist deployment record locally
-    let record = DeploymentRecord {
-        deployment_id: deployment_id.clone(),
-        storage_path: String::new(),
-        news_ids: Vec::new(),
-        timeline_ids: Vec::new(),
-        asset_paths: Vec::new(),
-    };
-    let deployments_dir = ctx.build_dir().join("deployments");
-    tokio::fs::create_dir_all(&deployments_dir).await?;
-    let path = deployments_dir.join(format!("{deployment_id}.json"));
-    tokio::fs::write(&path, serde_json::to_string_pretty(&record)?).await?;
-
     if dry_run {
         warn!("DRY RUN - no data written to cite.db");
         return Ok("Staging dry run complete".to_string());
     }
+
+    persist_deployment_record(
+        ctx,
+        &DeploymentRecord {
+            deployment_id,
+            storage_path: String::new(),
+            news_ids: Vec::new(),
+            timeline_ids: Vec::new(),
+            asset_paths: Vec::new(),
+        },
+    )
+    .await?;
 
     Ok(format!(
         "Staged {podcasts} podcast(s), {timelines} timeline(s) to local database"
@@ -381,7 +365,7 @@ async fn deploy_timeline(
                 let row_id = insert_row(
                     dctx,
                     "timeline_news",
-                    build_map(&[
+                    build_map([
                         ("parent_news_id", Value::Number(parent_news_id.into())),
                         ("child_news_id", Value::Number((*id).into())),
                         ("sort_order", Value::Number(sort_order.into())),
@@ -422,7 +406,7 @@ async fn deploy_citation_event(
         return Ok(None);
     }
 
-    let mut payload = build_map(&[
+    let mut payload = build_map([
         ("parent_news_id", Value::Number(parent_news_id.into())),
         ("title", Value::String(title.to_string())),
         ("sort_order", Value::Number(sort_order.into())),
@@ -494,8 +478,7 @@ async fn persist_deployment_record(
     let deployments_dir = ctx.build_dir().join("deployments");
     tokio::fs::create_dir_all(&deployments_dir).await?;
     let path = deployments_dir.join(format!("{}.json", record.deployment_id));
-    let json = serde_json::to_string_pretty(record)?;
-    tokio::fs::write(path, json).await?;
+    tokio::fs::write(path, serde_json::to_vec_pretty(record)?).await?;
     Ok(())
 }
 
@@ -605,8 +588,7 @@ struct Session {
 }
 
 fn session_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".cite").join("session.json")
+    crate::core::cite_home().join("session.json")
 }
 
 fn load_session() -> Option<Session> {
@@ -616,11 +598,7 @@ fn load_session() -> Option<Session> {
 }
 
 fn save_session(session: &Session) -> Result<(), CiteError> {
-    let path = session_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(session)?)?;
+    crate::core::write_private(&session_path(), &serde_json::to_vec_pretty(session)?)?;
     Ok(())
 }
 
@@ -631,7 +609,7 @@ fn resolve_bearer(backend: &BackendConfig, session: Option<&Session>) -> Result<
     match backend.staging_service_key.as_deref() {
         Some(key) if !key.is_empty() => Ok(key.to_string()),
         _ => Err(CiteError::Auth(
-            "Not logged in and no backend.staging_service_key configured. Run 'cite-cli login' or set the key in cite.toml"
+            "Not logged in and no backend.staging_service_key configured. Run 'cite login' or set the key in cite.toml"
                 .to_string(),
         )),
     }
@@ -671,34 +649,15 @@ pub async fn login(
 
     let email = match email {
         Some(e) => e,
-        None => {
-            print!("Email: ");
-            let _ = std::io::stdout().flush();
-            let mut s = String::new();
-            std::io::stdin().read_line(&mut s)?;
-            s.trim().to_string()
-        }
+        None => prompt_line("Email: ")?,
     };
     let password = match password {
         Some(p) => p,
-        None => {
-            print!("Password: ");
-            let _ = std::io::stdout().flush();
-            let mut s = String::new();
-            std::io::stdin().read_line(&mut s)?;
-            s.trim().to_string()
-        }
+        None => prompt_line("Password: ")?,
     };
 
     let client = reqwest::Client::new();
-    let url = format!(
-        "{}/auth/v1/token?grant_type=password",
-        backend
-            .staging_url
-            .as_deref()
-            .unwrap_or_default()
-            .trim_end_matches('/')
-    );
+    let url = format!("{}/auth/v1/token?grant_type=password", base_url(&backend));
     let response = client
         .post(&url)
         .header(
@@ -721,17 +680,17 @@ pub async fn login(
         .map_err(|e| CiteError::Auth(format!("Invalid login response: {e}")))?;
 
     let session = Session {
-        access_token: token.access_token.clone(),
+        access_token: token.access_token,
         refresh_token: token.refresh_token,
-        email: email.clone(),
+        email,
     };
     save_session(&session)?;
-    info!("Logged in as {}", email);
+    info!("Logged in as {}", session.email);
 
-    match fetch_user_artists(&backend, &token.access_token).await {
+    match fetch_user_artists(&client, &backend, &session.access_token).await {
         Ok(artists) if artists.is_empty() => {
             warn!("No artist linked to this account");
-            match prompt_create_artist(&backend, &token.access_token).await? {
+            match prompt_create_artist(&client, &backend, &session.access_token).await? {
                 Some((id, name)) => {
                     info!("Created artist '{name}' ({id})");
                 }
@@ -755,19 +714,13 @@ pub async fn login(
 }
 
 async fn fetch_user_artists(
+    client: &reqwest::Client,
     backend: &BackendConfig,
     token: &str,
 ) -> Result<Vec<(String, String)>, CiteError> {
-    let url = format!(
-        "{}/rest/v1/artists?select=id,name",
-        backend
-            .staging_url
-            .as_deref()
-            .unwrap_or_default()
-            .trim_end_matches('/')
-    );
+    let url = format!("{}/rest/v1/artists?select=id,name", base_url(backend));
     let resp = with_auth(
-        reqwest::Client::new().get(&url),
+        client.get(&url),
         backend.staging_service_key.as_deref().unwrap_or_default(),
         token,
     )
@@ -799,6 +752,7 @@ fn prompt_line(label: &str) -> Result<String, CiteError> {
 }
 
 async fn prompt_create_artist(
+    client: &reqwest::Client,
     backend: &BackendConfig,
     token: &str,
 ) -> Result<Option<(String, String)>, CiteError> {
@@ -809,7 +763,7 @@ async fn prompt_create_artist(
     let description = prompt_line("Description (optional): ")?;
     let website = prompt_line("Website URL (optional): ")?;
 
-    let mut payload = build_map(&[("name", Value::String(name.clone()))]);
+    let mut payload = build_map([("name", Value::String(name.clone()))]);
     if !description.is_empty() {
         payload.insert("description".into(), Value::String(description));
     }
@@ -817,16 +771,9 @@ async fn prompt_create_artist(
         payload.insert("website_url".into(), Value::String(website));
     }
 
-    let url = format!(
-        "{}/rest/v1/artists",
-        backend
-            .staging_url
-            .as_deref()
-            .unwrap_or_default()
-            .trim_end_matches('/')
-    );
+    let url = format!("{}/rest/v1/artists", base_url(backend));
     let resp = with_auth(
-        reqwest::Client::new().post(&url),
+        client.post(&url),
         backend.staging_service_key.as_deref().unwrap_or_default(),
         token,
     )
@@ -846,12 +793,11 @@ async fn prompt_create_artist(
     Ok(Some((id, name)))
 }
 
-fn build_map(fields: &[(&str, Value)]) -> serde_json::Map<String, Value> {
-    let mut map = serde_json::Map::new();
-    for (key, value) in fields {
-        map.insert((*key).to_string(), value.clone());
-    }
-    map
+fn build_map<const N: usize>(fields: [(&str, Value); N]) -> serde_json::Map<String, Value> {
+    fields
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
 }
 
 fn extract_id(value: &Value) -> Option<i64> {
@@ -978,11 +924,11 @@ async fn resolve_category_id(
     match insert_row(
         dctx,
         "categories",
-        build_map(&[
+        build_map([
             ("name", Value::String(name.to_string())),
             (
                 "description",
-                Value::String("Created automatically by cite-cli".to_string()),
+                Value::String("Created automatically by cite".to_string()),
             ),
         ]),
     )
@@ -1018,7 +964,7 @@ async fn ensure_domain_id(
     match insert_row(
         dctx,
         "domains",
-        build_map(&[
+        build_map([
             ("domain_name", Value::String(domain_name.to_string())),
             ("is_trusted", Value::Bool(false)),
         ]),
@@ -1043,7 +989,7 @@ async fn ensure_url_id(
         return Ok(id);
     }
 
-    let mut payload = build_map(&[("url", Value::String(url_value.to_string()))]);
+    let mut payload = build_map([("url", Value::String(url_value.to_string()))]);
     if let Some(count) = word_count {
         payload.insert("word_count".into(), Value::Number(count.into()));
     }
@@ -1095,7 +1041,7 @@ async fn insert_news_row(
     url_id: i64,
     artist_id: Uuid,
 ) -> Result<i64, CiteError> {
-    let mut payload = build_map(&[
+    let mut payload = build_map([
         ("title", Value::String(title.to_string())),
         ("category_id", Value::Number(category_id.into())),
         ("url_id", Value::Number(url_id.into())),
@@ -1135,7 +1081,7 @@ async fn update_news_thumbnail(
         dctx,
         "news",
         news_id,
-        build_map(&[("thumbnail", Value::String(thumbnail.to_string()))]),
+        build_map([("thumbnail", Value::String(thumbnail.to_string()))]),
     )
     .await
 }
@@ -1147,7 +1093,7 @@ async fn insert_podcast_row(
     podcast_url: &str,
     duration_minutes: Option<f64>,
 ) -> Result<(), CiteError> {
-    let mut payload = build_map(&[
+    let mut payload = build_map([
         ("news_id", Value::Number(news_id.into())),
         ("title", Value::String(title.to_string())),
         ("podcast_url", Value::String(podcast_url.to_string())),
@@ -1201,10 +1147,6 @@ fn summarize_content(content: Option<&str>) -> Option<String> {
     } else {
         Some(summary)
     }
-}
-
-fn word_count(content: &str) -> i64 {
-    content.split_whitespace().count() as i64
 }
 
 async fn upload_bytes(
@@ -1331,12 +1273,6 @@ mod tests {
         assert!(s.len() < long.len());
         assert_eq!(summarize_content(Some("   ")), None);
         assert_eq!(summarize_content(None), None);
-    }
-
-    #[test]
-    fn test_word_count() {
-        assert_eq!(word_count("one two three"), 3);
-        assert_eq!(word_count(""), 0);
     }
 
     #[test]

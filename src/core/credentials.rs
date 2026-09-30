@@ -12,11 +12,9 @@ pub struct SupabaseCredentials {
 }
 
 fn creds_path() -> PathBuf {
-    if let Ok(path) = std::env::var("CITE_CREDS_PATH") {
-        return PathBuf::from(path);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".cite").join("credentials.toml")
+    std::env::var_os("CITE_CREDS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::core::cite_home().join("credentials.toml"))
 }
 
 pub fn load_credentials() -> Result<SupabaseCredentials, CiteError> {
@@ -31,7 +29,7 @@ pub fn load_credentials() -> Result<SupabaseCredentials, CiteError> {
     let path = creds_path();
     if !path.exists() {
         return Err(CiteError::Config(
-            "No credentials found. Run 'cite-cli login' or set CITE_SUPABASE_URL and CITE_SUPABASE_API_KEY environment variables."
+            "No credentials found. Run 'cite login' or set CITE_SUPABASE_URL and CITE_SUPABASE_API_KEY environment variables."
                 .to_string(),
         ));
     }
@@ -57,18 +55,12 @@ pub fn load_credentials() -> Result<SupabaseCredentials, CiteError> {
 }
 
 pub fn save_credentials(creds: &SupabaseCredentials) -> Result<(), CiteError> {
-    let path = creds_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    #[derive(Serialize)]
+    struct CredentialsFile<'a> {
+        supabase: &'a SupabaseCredentials,
     }
-    let content = format!(
-        r#"[supabase]
-url = "{}"
-api_key = "{}"
-"#,
-        creds.url, creds.api_key
-    );
-    std::fs::write(&path, content)?;
+    let content = toml::to_string(&CredentialsFile { supabase: creds })?;
+    crate::core::write_private(&creds_path(), content.as_bytes())?;
     Ok(())
 }
 
@@ -76,6 +68,14 @@ api_key = "{}"
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Tests in this module mutate process-wide env vars; run them one at a time.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     struct EnvGuard {
         key: String,
@@ -121,12 +121,14 @@ mod tests {
 
     #[test]
     fn test_creds_path_default() {
+        let _lock = env_lock();
         let p = creds_path();
         assert!(p.to_string_lossy().contains(".cite/credentials.toml"));
     }
 
     #[test]
     fn test_credentials_from_env() {
+        let _lock = env_lock();
         let _guard_url = EnvGuard::set("CITE_SUPABASE_URL", "https://env-test.supabase.co");
         let _guard_key = EnvGuard::set("CITE_SUPABASE_API_KEY", "env-key-456");
 
@@ -138,7 +140,34 @@ mod tests {
     }
 
     #[test]
+    fn test_save_credentials_round_trip_escapes_values() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let creds_file = dir.path().join("nested").join("credentials.toml");
+        let _guard = EnvGuard::set("CITE_CREDS_PATH", creds_file.to_str().unwrap());
+        let _url_guard = EnvGuard::remove("CITE_SUPABASE_URL");
+        let _key_guard = EnvGuard::remove("CITE_SUPABASE_API_KEY");
+
+        let creds = SupabaseCredentials {
+            url: "https://x.supabase.co".into(),
+            api_key: r#"key-with-"quote"-and\backslash"#.into(),
+        };
+        save_credentials(&creds).unwrap();
+        let loaded = load_credentials().unwrap();
+        assert_eq!(loaded.url, creds.url);
+        assert_eq!(loaded.api_key, creds.api_key);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&creds_file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
     fn test_credentials_file_invalid() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let creds_file = dir.path().join("credentials.toml");
         std::fs::write(&creds_file, "not-toml").unwrap();
@@ -150,6 +179,7 @@ mod tests {
 
     #[test]
     fn test_credentials_missing_supabase_section() {
+        let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let creds_file = dir.path().join("credentials.toml");
         std::fs::write(&creds_file, "[other]\nkey = \"val\"").unwrap();

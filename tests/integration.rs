@@ -28,28 +28,12 @@ impl ProjectHarness {
         }
     }
 
-    fn binary() -> PathBuf {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.push("target/debug/cite-cli");
-        if p.exists() {
-            return p;
-        }
-        p.set_file_name("cite-cli");
-        let mut release = p.clone();
-        release.pop();
-        release.push("release/cite-cli");
-        if release.exists() {
-            return release;
-        }
-        p
-    }
-
     fn cmd(args: &[&str], db_path: &Path) -> (String, String, bool) {
-        let output = Command::new(Self::binary())
+        let output = Command::new(env!("CARGO_BIN_EXE_cite"))
             .args(args)
             .env("CITE_DB_PATH", db_path.to_str().unwrap())
             .output()
-            .expect("Failed to run cite-cli");
+            .expect("Failed to run cite");
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         (stdout, stderr, output.status.success())
@@ -57,7 +41,7 @@ impl ProjectHarness {
 
     fn cmd_ok(args: &[&str], db_path: &Path) {
         let (_, stderr, ok) = Self::cmd(args, db_path);
-        assert!(ok, "cite-cli {} failed: {stderr}", args.join(" "));
+        assert!(ok, "cite {} failed: {stderr}", args.join(" "));
     }
 
     fn run(&self, args: &[&str]) -> (String, String, bool) {
@@ -68,7 +52,7 @@ impl ProjectHarness {
 
     fn run_ok(&self, args: &[&str]) -> String {
         let (_, stderr, ok) = self.run(args);
-        assert!(ok, "cite-cli {} failed: {stderr}", args.join(" "));
+        assert!(ok, "cite {} failed: {stderr}", args.join(" "));
         stderr
     }
 
@@ -511,7 +495,7 @@ fn help_prints_usage() {
     let db_path = db_dir.path().join("cite.db");
     let (stdout, _, ok) = ProjectHarness::cmd(&["--help"], &db_path);
     assert!(ok);
-    assert!(stdout.contains("cite-cli"));
+    assert!(stdout.contains("Usage: cite"));
     assert!(stdout.contains("rollback"));
     assert!(stdout.contains("deploy"));
 }

@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::path::PathBuf;
 
 use tracing::{info, instrument, warn};
 
@@ -14,7 +13,7 @@ pub fn uninstall() -> Result<(), CiteError> {
         .parent()
         .ok_or_else(|| CiteError::Config("Cannot determine install directory".into()))?;
 
-    info!("cite-cli installed at: {}", current_exe.display());
+    info!("cite installed at: {}", current_exe.display());
 
     warn!("This will delete the binary. Shell config files might NOT be modified");
     print!("Are you sure? [y/N] ");
@@ -43,8 +42,7 @@ pub fn uninstall() -> Result<(), CiteError> {
     }
 
     // Remove local database, session, and credentials
-    let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
-    let cite_dir = PathBuf::from(&home).join(".cite");
+    let cite_dir = crate::core::cite_home();
     if cite_dir.exists() {
         let _ = std::fs::remove_file(cite_dir.join("cite.db"));
         let _ = std::fs::remove_file(cite_dir.join("session.json"));
@@ -59,18 +57,14 @@ pub fn uninstall() -> Result<(), CiteError> {
         }
     }
 
-    let shell_files = [
-        format!("{home}/.zshrc"),
-        format!("{home}/.bashrc"),
-        format!("{home}/.bash_profile"),
-        format!("{home}/.profile"),
-    ];
-
     let install_dir_str = install_dir.to_string_lossy();
-    let found = shell_files.iter().any(|p| {
-        std::fs::read_to_string(p)
-            .map(|c| c.contains(&*install_dir_str))
-            .unwrap_or(false)
+    let found = crate::core::home_dir().is_some_and(|home| {
+        [".zshrc", ".bashrc", ".bash_profile", ".profile"]
+            .iter()
+            .any(|rc| {
+                std::fs::read_to_string(home.join(rc))
+                    .is_ok_and(|c| c.contains(install_dir_str.as_ref()))
+            })
     });
 
     if found {
@@ -79,6 +73,6 @@ pub fn uninstall() -> Result<(), CiteError> {
         info!("    {install_dir_str}");
         info!("  Then restart your shell or run: source ~/.zshrc");
     }
-    info!("cite-cli has been uninstalled");
+    info!("cite has been uninstalled");
     Ok(())
 }

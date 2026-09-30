@@ -40,9 +40,9 @@ fn report_result(cli: &Cli, result: Result<String, CiteError>, err_prefix: &str)
     }
 }
 
-#[derive(Clone, Parser)]
+#[derive(Parser)]
 #[command(
-    name = "cite-cli",
+    name = "cite",
     version,
     about = "Create, validate, build, and deploy podcast content to Supabase"
 )]
@@ -66,7 +66,7 @@ pub struct Cli {
     pub dry_run: bool,
 }
 
-#[derive(Clone, Subcommand)]
+#[derive(Subcommand)]
 pub enum CliCommand {
     Init {
         name: String,
@@ -228,7 +228,7 @@ impl CliCommand {
                         );
                     } else {
                         info!("Running diagnostics");
-                        info!("cite.toml: missing (run 'cite-cli init')");
+                        info!("cite.toml: missing (run 'cite init')");
                         info!("metadata.yml: missing");
                     }
                     return Ok(());

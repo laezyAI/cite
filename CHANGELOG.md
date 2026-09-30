@@ -1,5 +1,10 @@
 # changelog
 
+## 0.1.0-alpha.5
+- Package renamed from `cite-cli` to `cite` (binary, installers, and repo `laezyAI/cite`)
+- Fixed `upgrade`, archived-project restore, and staging dry-run writing to the local database
+- Faster, lower-memory builds and doctor checks; credentials stored with owner-only permissions
+
 ## 0.1.0-alpha.4
 - TUI: switched input handling to crossterm's async event stream, removing the background polling task
 - TUI: deploy and rollback now show a Y/N confirmation before running
