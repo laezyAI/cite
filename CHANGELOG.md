@@ -1,6 +1,6 @@
 # changelog
 
-## 0.1.0-alpha.5
+## 0.1.0-beta.0
 - Package renamed from `cite-cli` to `cite` (binary, installers, and repo `laezyAI/cite`)
 - Fixed `upgrade`, archived-project restore, and staging dry-run writing to the local database
 - Faster, lower-memory builds and doctor checks; credentials stored with owner-only permissions

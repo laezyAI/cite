@@ -9,13 +9,13 @@ Create, validate, build, and deploy podcast content for aoux.
 (MacOS/Linux only)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/laezyAI/cite/releases/download/v0.1.0-alpha.5/cite-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/laezyAI/cite/releases/download/v0.1.0-beta.0/cite-installer.sh | sh
 ```
 
 (Windows only)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/laezyAI/cite/releases/download/v0.1.0-alpha.5/cite-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/laezyAI/cite/releases/download/v0.1.0-beta.0/cite-installer.ps1 | iex"
 ```
 
 ### From source
