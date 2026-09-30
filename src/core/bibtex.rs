@@ -1,4 +1,4 @@
-//! BibTeX citation files: parsing entries into timeline events, and writing them back.
+//! BibTeX citation files parsed into timeline events and rendered back (biblatex `date` beats `year`/`month`).
 
 use crate::core::metadata::TimelineEntry;
 
@@ -6,7 +6,6 @@ const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
 
-/// Timeline events from a BibTeX file. Entry ids are left empty for the caller to assign.
 pub fn parse(content: &str) -> Vec<TimelineEntry> {
     let mut entries = Vec::new();
     let mut pos = 0;
@@ -39,7 +38,6 @@ pub fn parse(content: &str) -> Vec<TimelineEntry> {
         let url = field("url")
             .or_else(|| field("link"))
             .or_else(|| field("doi").map(|doi| doi_url(&doi)));
-        // biblatex `date` (e.g. `2024-05-22`) is more precise than `year` and `month`.
         let date = field("date")
             .or_else(|| format_date(field("year").as_deref(), field("month").as_deref()));
         entries.push(TimelineEntry {
@@ -57,7 +55,6 @@ pub fn parse(content: &str) -> Vec<TimelineEntry> {
     entries
 }
 
-/// Writes timeline events back out as `@misc` BibTeX entries (the inverse of `parse`).
 pub fn render<'a>(entries: impl IntoIterator<Item = &'a TimelineEntry>) -> String {
     let mut out = String::new();
     for (i, entry) in entries.into_iter().enumerate() {
@@ -87,7 +84,6 @@ pub fn render<'a>(entries: impl IntoIterator<Item = &'a TimelineEntry>) -> Strin
     out
 }
 
-/// Index of the `}` closing the `{` at `open`.
 fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (i, &b) in bytes.iter().enumerate().skip(open) {
@@ -138,7 +134,6 @@ fn extract_field(body: &str, field: &str) -> Option<String> {
     }
 }
 
-/// A DOI as a resolvable link, so the app can open it like any other source.
 fn doi_url(doi: &str) -> String {
     if doi.starts_with("http://") || doi.starts_with("https://") {
         return doi.to_string();
@@ -147,7 +142,6 @@ fn doi_url(doi: &str) -> String {
     format!("https://doi.org/{doi}")
 }
 
-/// `YYYY` or `YYYY-MM` from BibTeX `year` / `month` fields.
 fn format_date(year: Option<&str>, month: Option<&str>) -> Option<String> {
     let year = year?.trim();
     let month = month.and_then(|m| {

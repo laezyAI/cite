@@ -1,11 +1,9 @@
-//! Markdown helpers shared by the compiler, deploy summaries, and doctor.
+//! Markdown helpers shared by the compiler, deploy summaries, and doctor (word counts, frontmatter, plain text).
 
 pub fn word_count(content: &str) -> i64 {
     content.split_whitespace().count() as i64
 }
 
-/// Splits a leading `---` YAML frontmatter block from the body. Returns
-/// `(None, markdown)` when there is no frontmatter or it is never closed.
 pub fn split_frontmatter(markdown: &str) -> (Option<&str>, &str) {
     let Some(rest) = markdown
         .strip_prefix("---")
@@ -23,8 +21,6 @@ pub fn split_frontmatter(markdown: &str) -> (Option<&str>, &str) {
     (None, markdown)
 }
 
-/// Readable prose from Markdown: drops frontmatter, headings, code blocks and images,
-/// and unwraps links and emphasis. Words are joined by single spaces.
 pub fn plain_text(markdown: &str) -> String {
     let (_, body) = split_frontmatter(markdown);
     let mut in_code = false;
@@ -44,7 +40,6 @@ pub fn plain_text(markdown: &str) -> String {
     words.join(" ")
 }
 
-/// `[text](url)` becomes `text`, images are dropped, and `*` / `` ` `` markers removed.
 fn unwrap_inline(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;

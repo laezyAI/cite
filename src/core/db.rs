@@ -1,3 +1,4 @@
+//! Local database at `~/.cite/cite.db`: last-build snapshots, build and deploy history, and caches (legacy `link` column kept as a fallback).
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -17,8 +18,6 @@ pub fn global_db_path() -> PathBuf {
         .unwrap_or_else(|| crate::core::cite_home().join("cite.db"))
 }
 
-/// The local database (`~/.cite/cite.db`): a snapshot of each project's last build
-/// plus build and deploy history, used for analytics and restoring archived projects.
 pub struct DbManager {
     conn: Connection,
 }
@@ -100,7 +99,6 @@ pub struct AllStats {
     pub total_builds: i64,
 }
 
-/// A podcast row with everything needed to restore project files.
 #[derive(Debug, Clone)]
 pub struct RestoredPodcast {
     pub id: String,
@@ -111,21 +109,17 @@ pub struct RestoredPodcast {
     pub thumbnail: Option<String>,
     pub audio: Option<String>,
     pub citation_file: Option<String>,
-    /// The podcast's metadata.yml entry as written; `None` in snapshots from older versions.
     pub metadata: Option<Podcast>,
     pub content: Option<String>,
 }
 
-/// A timeline event and the podcast it belongs to.
 #[derive(Debug, Clone)]
 pub struct RestoredTimeline {
     pub podcast_id: String,
-    /// From the podcast's BibTeX file, rather than written inline in metadata.
     pub from_citation: bool,
     pub entry: TimelineEntry,
 }
 
-/// Project-level data for restoring an archived project.
 #[derive(Debug, Clone)]
 pub struct RestoredProject {
     pub name: String,
@@ -148,7 +142,6 @@ fn opt_string(row: &libsql::Row, idx: i32) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Parameters for inserting one row of `timeline_entries`.
 fn entry_params(
     id: &str,
     project_id: &str,
@@ -267,7 +260,6 @@ impl DbManager {
             }
         }
 
-        // Older versions kept a BibTeX `link` apart from `url`; it is now read as a fallback.
         self.add_column_if_missing("timeline_entries", "link")
             .await?;
         self.add_column_if_missing("podcasts", "metadata").await?;
@@ -290,7 +282,6 @@ impl DbManager {
         Ok(())
     }
 
-    /// Adds a nullable TEXT column to databases created by an older version.
     async fn add_column_if_missing(&self, table: &str, column: &str) -> Result<(), CiteError> {
         let probe = format!("SELECT {column} FROM {table} LIMIT 1");
         if self.conn.query(&probe, ()).await.is_err() {
@@ -300,7 +291,6 @@ impl DbManager {
         Ok(())
     }
 
-    /// Replace the local snapshot of a project with the freshly compiled bundle.
     pub async fn sync_project(
         &self,
         ctx: &ProjectContext,

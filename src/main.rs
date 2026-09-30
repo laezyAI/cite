@@ -1,3 +1,4 @@
+//! Binary entry: parses CLI args, runs the matching command, or opens the TUI when no command is given.
 mod cli;
 mod core;
 mod tui;

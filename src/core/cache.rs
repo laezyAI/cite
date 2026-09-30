@@ -1,4 +1,4 @@
-//! Content hashing and the incremental build cache.
+//! Content hashing and the incremental build cache (SHA-256 of sources plus compiler version).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -39,7 +39,6 @@ impl BuildCache {
     }
 }
 
-/// Hash every existing file in `files`, off the async runtime.
 pub async fn hash_files(files: Vec<PathBuf>) -> Result<HashMap<String, String>, CiteError> {
     tokio::task::spawn_blocking(move || {
         let mut hashes = HashMap::with_capacity(files.len());
@@ -55,7 +54,6 @@ pub async fn hash_files(files: Vec<PathBuf>) -> Result<HashMap<String, String>, 
     .map_err(|e| CiteError::Config(format!("Hashing task failed: {e}")))?
 }
 
-/// Streaming SHA-256 of a file as lowercase hex; never loads the whole file into memory.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -63,7 +61,6 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(to_hex(&hasher.finalize()))
 }
 
-/// SHA-256 of in-memory bytes as lowercase hex.
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     to_hex(&Sha256::digest(bytes))
 }

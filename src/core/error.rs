@@ -1,3 +1,4 @@
+//! Single error type shared by every command, with plain messages for CLI and TUI output.
 use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum CiteError {

@@ -1,10 +1,4 @@
-//! `cite.lock`: the news row each episode was deployed as, per Supabase project.
-//!
-//! An episode is identified by its Markdown `file` path, the one thing an author
-//! writes that stays put while titles and content change. After a deploy the lock
-//! maps that path to the database id, so the next deploy updates the same row.
-//! The file lives next to `cite.toml` and is meant to be committed, like a
-//! `Cargo.lock`, so every machine deploying the project updates the same rows.
+//! `cite.lock`: the news row each episode was deployed as, per Supabase project (committed like `Cargo.lock`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +16,6 @@ const HEADER: &str = "\
 
 ";
 
-/// Supabase project URL -> episode file -> news id.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Lockfile {
@@ -34,7 +27,6 @@ impl Lockfile {
         root.join(LOCKFILE_NAME)
     }
 
-    /// Loads the project's lockfile; a missing file is an empty lock.
     pub fn load(root: &Path) -> Result<Self, CiteError> {
         let path = Self::path(root);
         match std::fs::read_to_string(&path) {
@@ -62,7 +54,6 @@ impl Lockfile {
             .insert(file.to_string(), news_id);
     }
 
-    /// Forgets episodes whose news rows were deleted (e.g. by a rollback).
     pub fn remove_news_ids(&mut self, backend: &str, news_ids: &[i64]) {
         if let Some(files) = self.backends.get_mut(backend) {
             files.retain(|_, id| !news_ids.contains(id));

@@ -1,3 +1,4 @@
+//! Loaded project: `cite.toml` plus parsed metadata with build paths, discovery, and clean.
 use std::path::{Path, PathBuf};
 
 use crate::core::CiteError;
@@ -5,7 +6,6 @@ use crate::core::db::DbManager;
 use crate::core::manifest::Manifest;
 use crate::core::metadata::Metadata;
 
-/// A loaded project: its root directory, `cite.toml`, and metadata file.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
     pub root: PathBuf,
@@ -50,13 +50,10 @@ impl ProjectContext {
         self.root.join("build")
     }
 
-    /// The compiled bundle `cite build` writes and `cite deploy` reads.
     pub fn bundle_path(&self) -> PathBuf {
         self.build_dir().join("content.json")
     }
 
-    /// Every file a build reads: the project config, the metadata file, and the
-    /// content and assets it references. A change to any of them triggers a rebuild.
     pub fn source_files(&self) -> Vec<PathBuf> {
         let config = ["cite.toml", self.manifest.project.metadata_file.as_str()];
         let referenced = self.metadata.referenced_files();

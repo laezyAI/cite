@@ -1,9 +1,4 @@
-//! `metadata.yml`: the episodes an author writes by hand, and the limits the
-//! Supabase schema puts on them.
-//!
-//! Input is forgiving where the intent is clear (stray whitespace, links written
-//! without `https://`, dates like `May 2024`) and strict where it is not: a
-//! misspelled key is an error naming the key, never silently ignored.
+//! Hand-written `metadata.yml` episodes with schema limits enforced (chrono needs full years; empty files mean no episodes).
 
 use std::fmt;
 
@@ -11,45 +6,32 @@ use chrono::{Datelike, NaiveDate};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// `VARCHAR(500)` on `news.title`, `podcasts.title` and `timeline_news.title`.
 pub const MAX_TITLE_CHARS: usize = 500;
-/// The `chk_news_summary_word_count` constraint on `news.summary`.
 pub const MAX_SUMMARY_WORDS: usize = 50;
 
-/// One entry of a podcast's `timeline:` list in metadata.yml.
-///
-/// Authors write plain values and the kind follows from the value:
-/// `content/refs.bib` is a citation file, `content/other-episode.md` links another
-/// episode of this project, a number links a news item already in the database,
-/// and a `title:`/`date:`/`url:` mapping is a single event written inline.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(into = "RawTimelineItem")]
 pub enum TimelineItem {
-    /// BibTeX file whose entries become timeline events.
     Citation(String),
-    /// Markdown file of another episode in this project.
     Episode(String),
-    /// Id of an existing news row.
     News(i64),
-    /// An event written directly in metadata.yml.
     Event(TimelineEntry),
 }
 
 impl TimelineItem {
-    /// A quoted news id (`- "42"`) means the same as a bare one.
     fn from_path(path: &str) -> Self {
-        let path = path.trim().to_string();
-        if let Ok(id) = path.parse() {
+        let mut cleaned = path.trim().to_string();
+        tidy_path(&mut cleaned);
+        if let Ok(id) = cleaned.parse() {
             Self::News(id)
-        } else if path.to_lowercase().ends_with(".bib") {
-            Self::Citation(path)
+        } else if cleaned.to_lowercase().ends_with(".bib") {
+            Self::Citation(cleaned)
         } else {
-            Self::Episode(path)
+            Self::Episode(cleaned)
         }
     }
 }
 
-/// The YAML shape of a timeline item: a path, a number, or an event mapping.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum RawTimelineItem {
@@ -68,9 +50,6 @@ impl From<TimelineItem> for RawTimelineItem {
     }
 }
 
-/// Hand-written rather than `#[serde(untagged)]` so a mistake inside an event
-/// (e.g. `tilte:`) is reported as such, with its line, instead of "did not match
-/// any variant".
 impl<'de> Deserialize<'de> for TimelineItem {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         struct ItemVisitor;
@@ -114,7 +93,6 @@ pub struct Podcast {
     pub title: String,
     pub file: String,
 
-    /// Hand-written summary; without one, the first words of `file` are used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 
@@ -142,7 +120,6 @@ impl Podcast {
         })
     }
 
-    /// Events written inline in this podcast's timeline.
     pub fn inline_events(&self) -> impl Iterator<Item = &TimelineEntry> {
         self.timeline.iter().filter_map(|item| match item {
             TimelineItem::Event(entry) => Some(entry),
@@ -150,10 +127,9 @@ impl Podcast {
         })
     }
 
-    /// Trims every value, drops empty optional ones, and completes scheme-less links.
     fn tidy(&mut self) {
         tidy_text(&mut self.title);
-        tidy_text(&mut self.file);
+        tidy_path(&mut self.file);
         for field in [
             &mut self.summary,
             &mut self.category,
@@ -162,24 +138,28 @@ impl Podcast {
         ] {
             tidy_optional(field);
         }
+        tidy_path_optional(&mut self.thumbnail);
+        tidy_path_optional(&mut self.audio);
         tidy_url(&mut self.source_url);
         for item in &mut self.timeline {
-            if let TimelineItem::Event(entry) = item {
-                entry.tidy();
+            match item {
+                TimelineItem::Event(entry) => entry.tidy(),
+                TimelineItem::Citation(path) | TimelineItem::Episode(path) => {
+                    tidy_text(path);
+                    tidy_path(path);
+                }
+                TimelineItem::News(_) => {}
             }
         }
     }
 }
 
-/// A timeline event, from a BibTeX entry or written inline in metadata.yml.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TimelineEntry {
-    /// Local id assigned by the compiler; never written by authors.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub id: String,
     pub title: String,
-    /// See [`parse_date`] for the accepted forms.
     #[serde(
         deserialize_with = "string_or_number",
         skip_serializing_if = "Option::is_none"
@@ -192,7 +172,6 @@ pub struct TimelineEntry {
 }
 
 impl TimelineEntry {
-    /// The event date as an RFC 3339 timestamp; `None` when absent or not understood.
     pub fn event_date(&self) -> Option<String> {
         let day = parse_date(self.date.as_deref()?)?;
         Some(format!("{day}T00:00:00Z"))
@@ -206,8 +185,6 @@ impl TimelineEntry {
     }
 }
 
-/// A hand-written date: `2024`, `2024-05`, `2024-05-22` (also with `/`),
-/// `May 2024`, `22 May 2024` or `May 22, 2024`. A missing month or day is the first.
 fn parse_date(text: &str) -> Option<NaiveDate> {
     const FORMATS: [&str; 4] = ["%Y-%m-%d", "%d %B %Y", "%B %d, %Y", "%B %d %Y"];
     let text = text.trim().replace('/', "-");
@@ -220,7 +197,6 @@ fn parse_date(text: &str) -> Option<NaiveDate> {
             FORMATS
                 .iter()
                 .filter_map(|format| NaiveDate::parse_from_str(candidate, format).ok())
-                // chrono reads `May 2024` as May 20 of year 24; the year must be written out.
                 .find(|day| text.contains(&format!("{:04}", day.year())))
         })
 }
@@ -241,7 +217,43 @@ fn tidy_optional(value: &mut Option<String>) {
     }
 }
 
-/// `www.example.com/story` becomes `https://www.example.com/story`.
+fn tidy_path(value: &mut String) {
+    let mut text = value.trim().to_string();
+    while let Some(rest) = text.strip_prefix("./").map(str::trim_start) {
+        text = rest.to_string();
+    }
+    while text.contains("//") {
+        let mut cleaned = String::with_capacity(text.len());
+        let mut last_slash = false;
+        for c in text.chars() {
+            if c == '/' {
+                if !last_slash {
+                    cleaned.push(c);
+                }
+                last_slash = true;
+            } else {
+                cleaned.push(c);
+                last_slash = false;
+            }
+        }
+        if cleaned.len() == text.len() {
+            break;
+        }
+        text = cleaned;
+    }
+    *value = text;
+}
+
+fn tidy_path_optional(value: &mut Option<String>) {
+    if let Some(text) = value {
+        tidy_text(text);
+        tidy_path(text);
+    }
+    if value.as_deref() == Some("") {
+        *value = None;
+    }
+}
+
 fn tidy_url(value: &mut Option<String>) {
     tidy_optional(value);
     if let Some(url) = value
@@ -251,7 +263,6 @@ fn tidy_url(value: &mut Option<String>) {
     }
 }
 
-/// Accepts `date: 2024` (a YAML number) as well as `date: "2024-05"`.
 fn string_or_number<'de, D: Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -272,9 +283,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Parses metadata.yml as written by hand, normalizing values (see [`Podcast`]).
     pub fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        // An empty file (or one with only comments) is a project without episodes.
         if yaml
             .lines()
             .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
@@ -462,6 +471,24 @@ podcasts:
                 .unwrap()
                 .podcasts
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_parse_normalizes_dot_slash_paths() {
+        let meta = Metadata::parse(
+            "podcasts:\n  - title: Ep\n    file: ./content//ep.md\n    thumbnail: ./assets/image//t.jpg\n    timeline:\n      - ' ./content/refs.bib '\n      - ' ./content/other.md '\n",
+        )
+        .unwrap();
+        let pod = &meta.podcasts[0];
+        assert_eq!(pod.file, "content/ep.md");
+        assert_eq!(pod.thumbnail.as_deref(), Some("assets/image/t.jpg"));
+        assert_eq!(
+            pod.timeline,
+            vec![
+                TimelineItem::Citation("content/refs.bib".to_string()),
+                TimelineItem::Episode("content/other.md".to_string()),
+            ]
         );
     }
 

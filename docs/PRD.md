@@ -375,4 +375,3 @@ Controls:
 | `Ctrl+C`              | Cancel a running command, or quit if idle                     |
 | `Esc`                 | Close a dialog or clear typed arguments, else quit            |
 | `Ctrl+Q`              | Quit                                                          |
-

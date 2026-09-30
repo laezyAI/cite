@@ -30,7 +30,6 @@ impl ProjectHarness {
         }
     }
 
-    /// Runs cite isolated from the developer's `~/.cite` login and credentials.
     fn cmd(args: &[&str], db_path: &Path) -> (String, String, bool) {
         let home = db_path.parent().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_cite"))
@@ -76,7 +75,6 @@ impl ProjectHarness {
         fs::write(path, text).unwrap();
     }
 
-    /// Points the project at a valid artist, without a backend.
     fn set_artist(&self) {
         let toml = format!(
             "[project]\nname = \"{}\"\nartist_id = \"{ARTIST}\"\n",
@@ -94,8 +92,6 @@ impl ProjectHarness {
         serde_json::from_str(&content).unwrap()
     }
 }
-
-// ── init ────────────────────────────────────────────────────────
 
 #[test]
 fn init_creates_project_structure() {
@@ -127,8 +123,6 @@ fn init_is_idempotent_on_existing_project() {
     assert!(stderr.contains("Skipped"));
 }
 
-// ── doctor ────────────────────────────────────────────────────
-
 #[test]
 fn doctor_catches_missing_file() {
     let h = ProjectHarness::new("missing-file");
@@ -153,8 +147,6 @@ fn doctor_catches_missing_metadata() {
     assert!(stderr.contains("not found"));
 }
 
-// ── doctor (includes lint checks) ───────────────────────────────
-
 #[test]
 fn doctor_warns_on_short_content() {
     let h = ProjectHarness::new("short-content");
@@ -171,8 +163,6 @@ podcasts:
     assert!(ok);
     assert!(stderr.contains("low word count"), "{stderr}");
 }
-
-// ── build ───────────────────────────────────────────────────────
 
 #[test]
 fn build_produces_valid_content_json() {
@@ -300,8 +290,6 @@ fn build_empty_project_succeeds() {
     assert_eq!(pods.len(), 0, "template has no default podcast");
 }
 
-// ── status ──────────────────────────────────────────────────────
-
 #[test]
 fn doctor_shows_project_info_with_status() {
     let h = ProjectHarness::new("status-test");
@@ -326,8 +314,6 @@ podcasts:
     assert!(stderr.contains("Last build:"));
 }
 
-// ── doctor ──────────────────────────────────────────────────────
-
 #[test]
 fn doctor_detects_missing_project() {
     let db_dir = tempfile::tempdir().unwrap();
@@ -348,8 +334,6 @@ fn doctor_passes_on_new_project() {
     assert!(stderr.contains("metadata.yml found"));
 }
 
-// ── clean ───────────────────────────────────────────────────────
-
 #[test]
 fn clean_removes_artifacts_and_is_idempotent() {
     let h = ProjectHarness::new("clean-test");
@@ -369,8 +353,6 @@ podcasts:
 
     h.run_ok(&["clean"]);
 }
-
-// ── deploy ──────────────────────────────────────────────────────
 
 #[test]
 fn deploy_fails_without_backend() {
@@ -433,8 +415,6 @@ fn misspelled_metadata_key_is_reported_with_its_line() {
     }
 }
 
-// ── rollback ────────────────────────────────────────────────────
-
 #[test]
 fn rollback_fails_without_backend() {
     let h = ProjectHarness::new("no-backend-rb");
@@ -446,8 +426,6 @@ fn rollback_fails_without_backend() {
             || stderr.contains("No credentials")
     );
 }
-
-// ── e2e ─────────────────────────────────────────────────────────
 
 #[test]
 fn full_workflow_end_to_end() {
@@ -474,7 +452,6 @@ podcasts:
     );
 
     h.run_ok(&["doctor"]);
-    // No explicit build: deploy builds, and --dry-run never contacts Supabase.
     let (stdout, stderr, ok) = h.run(&["deploy", "--dry-run"]);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("Dry run complete"), "{stdout}");
@@ -498,8 +475,6 @@ podcasts:
     h.run_ok(&["clean"]);
     assert!(!h.project.join("build").exists());
 }
-
-// ── cli basics ──────────────────────────────────────────────────
 
 #[test]
 fn help_prints_usage() {

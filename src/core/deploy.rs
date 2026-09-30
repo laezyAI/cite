@@ -1,5 +1,4 @@
-//! Deploying a built project to Supabase: news, podcast and timeline rows plus their
-//! storage objects. Re-deploying updates the rows recorded in `cite.lock`.
+//! Deploying built projects to Supabase news, podcast, and timeline rows with storage objects (validates before writing; updates lock-recorded rows; descriptions always sent; internal urls fill missing sources).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +23,6 @@ use crate::core::supabase::{Supabase, encode, row};
 
 const ASSETS_BUCKET: &str = "assets";
 const PODCASTS_BUCKET: &str = "podcasts";
-/// Columns of an existing news row that a redeploy compares against.
 const EXISTING_NEWS_COLUMNS: &str = "select=id,thumbnail,podcasts!fk_podcasts_news(podcast_url)";
 
 struct DeployContext {
@@ -34,29 +32,21 @@ struct DeployContext {
     artist_id: Uuid,
 }
 
-/// What one deployment wrote, kept in `.cite/deployments/` for `cite rollback`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeploymentRecord {
     deployment_id: String,
-    /// Supabase project the deployment went to; rollback refuses any other.
     #[serde(default)]
     backend_url: String,
-    /// Bundle JSON uploaded by earlier versions; rollback still removes it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     storage_path: String,
-    /// News rows this deployment created; rollback deletes them, which cascades
-    /// to their podcast and timeline rows.
     news_ids: Vec<i64>,
-    /// Existing news rows this deployment updated in place; rollback leaves them.
     #[serde(default)]
     updated_news_ids: Vec<i64>,
     timeline_ids: Vec<i64>,
-    /// Objects uploaded for created news; rollback deletes them.
     #[serde(default)]
     asset_paths: Vec<String>,
 }
 
-/// The deployed state of a news row that a redeploy updates in place.
 struct ExistingNews {
     id: i64,
     thumbnail: Option<String>,
@@ -65,7 +55,6 @@ struct ExistingNews {
 
 impl ExistingNews {
     fn from_row(row: &Value) -> Option<Self> {
-        // PostgREST embeds a one-to-one relation as an object, older versions as an array.
         let podcast = match &row["podcasts"] {
             Value::Array(rows) => rows.first(),
             other => Some(other),
@@ -102,8 +91,6 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// Refuses what `cite doctor` reports as an error, so a mistake in metadata is
-/// named up front instead of surfacing as a database constraint halfway through.
 fn ensure_valid(ctx: &ProjectContext) -> Result<(), CiteError> {
     let errors = doctor::validate(ctx).errors;
     if errors.is_empty() {
@@ -116,8 +103,6 @@ fn ensure_valid(ctx: &ProjectContext) -> Result<(), CiteError> {
     )))
 }
 
-/// The build of the current sources: rebuilt first when anything changed since the
-/// last build, so a deploy never ships stale content.
 async fn current_bundle(db: &DbManager, ctx: &ProjectContext) -> Result<ContentBundle, CiteError> {
     let bundle_path = ctx.bundle_path();
     let force = !bundle_path.is_file();
@@ -129,14 +114,11 @@ async fn current_bundle(db: &DbManager, ctx: &ProjectContext) -> Result<ContentB
     Ok(serde_json::from_str(&json)?)
 }
 
-/// Validates, builds if needed, and deploys the project. With `dry_run`, only
-/// previews the deploy from local state.
 pub async fn deploy(
     db: &DbManager,
     ctx: &ProjectContext,
     dry_run: bool,
 ) -> Result<String, CiteError> {
-    // Everything that can fail without side effects runs before the first write.
     let artist_id = parse_artist_id(&ctx.manifest.project.artist_id)?;
     ensure_valid(ctx)?;
     let bundle = current_bundle(db, ctx).await?;
@@ -186,9 +168,6 @@ pub async fn deploy(
     ))
 }
 
-/// Lists what a deploy would create or update, from `cite.lock` alone; never
-/// contacts Supabase. Episodes without a lock entry may still adopt an existing
-/// news item with the same title when deployed.
 fn preview(ctx: &ProjectContext, bundle: &ContentBundle) -> Result<String, CiteError> {
     warn!("DRY RUN - nothing will be sent");
     let lock = Lockfile::load(&ctx.root)?;
@@ -245,7 +224,6 @@ pub async fn rollback(ctx: &ProjectContext, deployment_id: &str) -> Result<Strin
 
     warn!("Rolling back deployment: {deployment_id}");
 
-    // Deleting a news row cascades to its podcast and timeline rows.
     for news_id in &record.news_ids {
         api.delete("news", *news_id).await?;
         info!("Cleared news {news_id}");
@@ -277,8 +255,6 @@ pub async fn rollback(ctx: &ProjectContext, deployment_id: &str) -> Result<Strin
     Ok("Rollback complete".to_string())
 }
 
-/// Confirms the artist exists and, for a logged-in user, belongs to them. Without
-/// this the first insert fails with an opaque row-level-security error.
 async fn ensure_artist_owned(conn: &Connection, artist_id: Uuid) -> Result<(), CiteError> {
     let rows = conn
         .api
@@ -299,12 +275,6 @@ async fn ensure_artist_owned(conn: &Connection, artist_id: Uuid) -> Result<(), C
     Ok(())
 }
 
-/// Deploys in two passes:
-/// 1. every episode's news row, assets and podcast row, so each episode has a news id;
-/// 2. every timeline, which may link other episodes of the project by file.
-///
-/// Each episode's news id is recorded in `lock` as soon as it exists, and each created
-/// row or object in `record`, so a failed deploy can be resumed or rolled back.
 async fn deploy_bundle(
     dctx: &DeployContext,
     bundle: &ContentBundle,
@@ -329,7 +299,6 @@ async fn deploy_bundle(
         .collect();
     for (pod, news_id, created) in deployed {
         if !created {
-            // Timeline rows are rebuilt from the current metadata.
             dctx.api
                 .delete_where("timeline_news", &format!("parent_news_id=eq.{news_id}"))
                 .await?;
@@ -350,10 +319,6 @@ async fn deploy_bundle(
     Ok(())
 }
 
-/// The news row an episode was previously deployed as. The id in `cite.lock` is
-/// authoritative; only without an entry (e.g. the first deploy with this version,
-/// or a project whose lockfile was not committed) is the artist's latest news with
-/// the same title adopted.
 async fn find_existing_news(
     dctx: &DeployContext,
     known_id: Option<i64>,
@@ -387,9 +352,6 @@ async fn find_existing_news(
     Ok(news)
 }
 
-/// Creates the episode's news row, or updates `existing` in place (keeping its
-/// `created_at` and `published_at`), then syncs its assets and podcast row.
-/// Returns the news id and whether the row was created.
 async fn deploy_news(
     dctx: &DeployContext,
     podcast: &BundlePodcast,
@@ -401,7 +363,6 @@ async fn deploy_news(
     let title = &podcast.podcast.title;
     let content = podcast.content.as_deref();
 
-    // `news.url_id` is required; an episode without a source gets a stable internal one.
     let fallback_url = format!(
         "cite://{}/{}/{}",
         dctx.artist_id, dctx.project, podcast.podcast.file
@@ -446,14 +407,7 @@ async fn deploy_news(
         }
     };
 
-    let thumbnail = sync_asset(
-        dctx,
-        podcast.podcast.thumbnail.as_deref(),
-        ASSETS_BUCKET,
-        &format!("news_{news_id}"),
-        current_thumbnail.as_deref(),
-    )
-    .await?;
+    let thumbnail = persist_thumbnail(dctx, podcast, news_id, current_thumbnail.as_deref()).await?;
     if created {
         record.asset_paths.extend(thumbnail.clone());
     }
@@ -464,46 +418,87 @@ async fn deploy_news(
         delete_replaced_object(api, current_thumbnail.as_deref(), thumbnail.as_deref()).await;
     }
 
-    let audio = sync_asset(
-        dctx,
-        podcast.podcast.audio.as_deref(),
-        PODCASTS_BUCKET,
-        &format!("podcast_{news_id}"),
-        current_audio.as_deref(),
-    )
-    .await?;
+    let audio = persist_audio(dctx, podcast, news_id, current_audio.as_deref()).await?;
     if created {
         record.asset_paths.extend(audio.clone());
     }
-    match &audio {
-        Some(path) => {
-            let duration_minutes = podcast
-                .audio_meta
-                .as_ref()
-                .map(|meta| meta.duration_secs / 60.0);
-            upsert_podcast_row(api, news_id, title, path, duration_minutes).await?;
-        }
-        None if current_audio.is_some() => {
-            api.delete_where("podcasts", &format!("news_id=eq.{news_id}"))
-                .await?;
-        }
-        None => {}
-    }
+    persist_podcast_row(
+        api,
+        podcast,
+        news_id,
+        title,
+        audio.as_deref(),
+        current_audio.is_some(),
+    )
+    .await?;
     delete_replaced_object(api, current_audio.as_deref(), audio.as_deref()).await;
 
     Ok((news_id, created))
 }
 
-/// One episode's timeline, ready to deploy.
+async fn persist_thumbnail(
+    dctx: &DeployContext,
+    podcast: &BundlePodcast,
+    news_id: i64,
+    current: Option<&str>,
+) -> Result<Option<String>, CiteError> {
+    sync_asset(
+        dctx,
+        podcast.podcast.thumbnail.as_deref(),
+        ASSETS_BUCKET,
+        &format!("news_{news_id}"),
+        current,
+    )
+    .await
+}
+
+async fn persist_audio(
+    dctx: &DeployContext,
+    podcast: &BundlePodcast,
+    news_id: i64,
+    current: Option<&str>,
+) -> Result<Option<String>, CiteError> {
+    sync_asset(
+        dctx,
+        podcast.podcast.audio.as_deref(),
+        PODCASTS_BUCKET,
+        &format!("podcast_{news_id}"),
+        current,
+    )
+    .await
+}
+
+async fn persist_podcast_row(
+    api: &Supabase,
+    podcast: &BundlePodcast,
+    news_id: i64,
+    title: &str,
+    audio: Option<&str>,
+    had_audio: bool,
+) -> Result<(), CiteError> {
+    match audio {
+        Some(path) => {
+            let duration_minutes = podcast
+                .audio_meta
+                .as_ref()
+                .map(|meta| meta.duration_secs / 60.0);
+            upsert_podcast_row(api, news_id, title, path, duration_minutes).await
+        }
+        None if had_audio => {
+            api.delete_where("podcasts", &format!("news_id=eq.{news_id}"))
+                .await
+        }
+        None => Ok(()),
+    }
+}
+
 struct Timeline<'a> {
     parent_news_id: i64,
     items: &'a [TimelineItem],
     citation_groups: &'a [&'a BundleTimeline],
-    /// News id of every episode in the project, by Markdown file.
     episode_ids: &'a HashMap<&'a str, i64>,
 }
 
-/// Inserts the timeline rows in metadata order, appending each new row id to `timeline_ids`.
 async fn deploy_timeline(
     api: &Supabase,
     timeline: &Timeline<'_>,
@@ -566,7 +561,6 @@ async fn deploy_timeline(
     Ok(())
 }
 
-/// Inserts one timeline event (from BibTeX or written inline); skipped without a title.
 async fn deploy_event(
     api: &Supabase,
     parent_news_id: i64,
@@ -579,7 +573,6 @@ async fn deploy_event(
         return Ok(None);
     }
 
-    // The app parses `description` as a non-null string, so always send one.
     let description = entry.description.as_deref().map(str::trim);
     let mut payload = row([
         ("parent_news_id", Value::from(parent_news_id)),
@@ -624,8 +617,6 @@ async fn persist_deployment_record(
     Ok(())
 }
 
-/// Loads a deployment record, also looking in `build/deployments/` where versions
-/// before 0.1.0-beta.1 kept them.
 async fn load_deployment_record(
     ctx: &ProjectContext,
     deployment_id: &str,
@@ -659,8 +650,6 @@ async fn fetch_categories(api: &Supabase) -> Result<Vec<Category>, CiteError> {
         .collect())
 }
 
-/// Category id for each podcast, in order. Runs before any insert so a missing or
-/// unknown category fails the deploy without leaving partial rows behind.
 async fn resolve_category_ids(
     api: &Supabase,
     podcasts: &[BundlePodcast],
@@ -680,8 +669,6 @@ async fn resolve_category_ids(
     Ok(ids)
 }
 
-/// Finds a category by name (case-insensitive), creating it when the key allows it.
-/// Only `service_role` may insert categories; regular logins must use an existing one.
 async fn resolve_category_id(
     api: &Supabase,
     name: &str,
@@ -720,7 +707,6 @@ fn category_names(categories: &[Category]) -> String {
         .join(", ")
 }
 
-/// Domains are server-managed; a blocked insert just leaves the url without a domain.
 async fn ensure_domain_id(api: &Supabase, domain_name: &str) -> Option<i64> {
     if let Ok(Some(id)) = api.find_id("domains", "domain_name", domain_name).await {
         return Some(id);
@@ -760,9 +746,6 @@ async fn ensure_url_id(
     api.insert("urls", &payload).await
 }
 
-/// Uploads a project file as `<artist>/<stem>-<hash>.<ext>` and returns its storage path.
-/// The content hash in the name skips re-uploading an unchanged file (`current` already
-/// points at it) and gives a changed file a new URL, so clients never get a stale cached copy.
 async fn sync_asset(
     dctx: &DeployContext,
     asset: Option<&str>,
@@ -789,7 +772,6 @@ async fn sync_asset(
         .map(Some)
 }
 
-/// Best-effort removal of a storage object the row no longer references.
 async fn delete_replaced_object(api: &Supabase, old: Option<&str>, new: Option<&str>) {
     let Some(old) = old.filter(|old| Some(*old) != new) else {
         return;
@@ -806,7 +788,6 @@ fn file_extension(path: &Path) -> &str {
         .unwrap_or("bin")
 }
 
-/// Creates or updates the podcast row for `news_id` (unique per news item).
 async fn upsert_podcast_row(
     api: &Supabase,
     news_id: i64,
@@ -827,8 +808,6 @@ async fn upsert_podcast_row(
     api.upsert("podcasts", &payload, "news_id").await
 }
 
-/// The registrable host of a URL as stored in `domains.domain_name`: lowercase,
-/// without credentials, port or a leading `www.` (so it matches e.g. `reuters.com`).
 fn extract_domain_name(source_url: &str) -> Option<String> {
     let without_scheme = source_url
         .split_once("//")
@@ -840,7 +819,6 @@ fn extract_domain_name(source_url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// The first `MAX_SUMMARY_WORDS` words of the episode's prose, with "..." when truncated.
 fn summarize_content(content: Option<&str>) -> Option<String> {
     let text = plain_text(content?);
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -1327,8 +1305,6 @@ podcasts:
         }
         lock.save(&ctx.root).unwrap();
 
-        // Both rows recorded in cite.lock were deleted remotely (`id=eq.5` finds nothing),
-        // so the episodes are published again rather than matched to other news by title.
         deploy(&db, &ctx, false).await.expect("deploy");
         assert_eq!(news_post.hits() + news_post_two.hits(), 2);
         assert_eq!(title_lookup.hits(), 0, "cite.lock is authoritative");

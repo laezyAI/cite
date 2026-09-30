@@ -1,4 +1,4 @@
-//! Minimal client for the Supabase REST (PostgREST) and Storage APIs.
+//! Supabase REST and Storage client with retries (PostgREST embeds one-to-one relations as objects or arrays).
 
 use std::time::Duration;
 
@@ -9,12 +9,10 @@ use tracing::{info, warn};
 
 use crate::core::CiteError;
 
-/// A row payload: column name to JSON value.
 pub type Row = Map<String, Value>;
 
 const UPLOAD_ATTEMPTS: u64 = 3;
 
-/// Authenticated client for one Supabase project.
 #[derive(Debug, Clone)]
 pub struct Supabase {
     client: reqwest::Client,
@@ -33,7 +31,6 @@ impl Supabase {
         }
     }
 
-    /// Project URL, without a trailing slash.
     pub fn url(&self) -> &str {
         &self.base_url
     }
@@ -45,7 +42,6 @@ impl Supabase {
             .header("Authorization", format!("Bearer {}", self.bearer))
     }
 
-    /// Rows of `table` matching a PostgREST query string, e.g. `select=id&name=eq.x`.
     pub async fn select(&self, table: &str, query: &str) -> Result<Vec<Value>, CiteError> {
         let response = self
             .request(Method::GET, &format!("/rest/v1/{table}?{query}"))
@@ -55,7 +51,6 @@ impl Supabase {
         Ok(response.json().await?)
     }
 
-    /// Id of the first row of `table` whose `field` equals `value`.
     pub async fn find_id(
         &self,
         table: &str,
@@ -67,7 +62,6 @@ impl Supabase {
         Ok(rows.first().and_then(|row| row["id"].as_i64()))
     }
 
-    /// Inserts one row and returns it as stored.
     pub async fn insert_returning(&self, table: &str, row: &Row) -> Result<Value, CiteError> {
         let response = self
             .request(Method::POST, &format!("/rest/v1/{table}"))
@@ -82,7 +76,6 @@ impl Supabase {
         })
     }
 
-    /// Inserts one row and returns its bigint `id`.
     pub async fn insert(&self, table: &str, row: &Row) -> Result<i64, CiteError> {
         self.insert_returning(table, row).await?["id"]
             .as_i64()
@@ -99,7 +92,6 @@ impl Supabase {
         Ok(())
     }
 
-    /// Inserts `row`, or updates the existing row whose unique `on_conflict` column matches.
     pub async fn upsert(&self, table: &str, row: &Row, on_conflict: &str) -> Result<(), CiteError> {
         let response = self
             .request(
@@ -118,7 +110,6 @@ impl Supabase {
         self.delete_where(table, &format!("id=eq.{id}")).await
     }
 
-    /// Deletes every row of `table` matching a PostgREST filter, e.g. `news_id=eq.3`.
     pub async fn delete_where(&self, table: &str, filter: &str) -> Result<(), CiteError> {
         let response = self
             .request(Method::DELETE, &format!("/rest/v1/{table}?{filter}"))
@@ -132,8 +123,6 @@ impl Supabase {
         Ok(())
     }
 
-    /// Uploads (or overwrites) an object, retrying transient failures, and returns its
-    /// `bucket/object_path` storage path (the form stored in the database).
     pub async fn upload(
         &self,
         bucket: &str,
@@ -174,7 +163,6 @@ impl Supabase {
         )))
     }
 
-    /// Deletes an object by its `bucket/object_path` storage path.
     pub async fn delete_object(&self, storage_path: &str) -> Result<(), CiteError> {
         let response = self
             .request(
@@ -192,7 +180,6 @@ impl Supabase {
     }
 }
 
-/// Builds a row payload from `(column, value)` pairs.
 pub fn row<const N: usize>(fields: [(&str, Value); N]) -> Row {
     fields
         .into_iter()
@@ -200,7 +187,6 @@ pub fn row<const N: usize>(fields: [(&str, Value); N]) -> Row {
         .collect()
 }
 
-/// Percent-encodes a value for use in a PostgREST filter.
 pub fn encode(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }

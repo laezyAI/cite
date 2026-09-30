@@ -1,3 +1,4 @@
+//! Standalone interactive dashboard running the same commands with projects, logs, and analytics panes.
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -31,7 +32,6 @@ const READY: Color = Color::Green;
 const MUTED: Color = Color::DarkGray;
 const ON_ACCENT: Color = Color::Black;
 
-/// Oldest log lines are dropped past this cap so long sessions don't grow without bound.
 const MAX_LOG_LINES: usize = 5_000;
 
 struct TerminalGuard;
@@ -111,7 +111,6 @@ pub enum Focus {
     Logs,
 }
 
-/// Panels in `Tab` order.
 const FOCUS_ORDER: [Focus; 4] = [
     Focus::Projects,
     Focus::Commands,
@@ -1673,36 +1672,48 @@ async fn exec_init(cwd: PathBuf, raw: String) {
 }
 
 async fn exec_build(root: Option<PathBuf>, raw: String) {
-    let Some((ctx, db)) = load_project_context(root).await else {
-        return;
-    };
     let force = raw.split_whitespace().any(|w| w == "--force");
-    match compiler::compile(&db, &ctx, force).await {
-        Ok(outcome) => outcome.emit(),
-        Err(e) => error!("Build failed: {e}"),
-    }
+    run_with_context(root, "Build", |ctx, db| async move {
+        match compiler::compile(&db, &ctx, force).await {
+            Ok(outcome) => outcome.emit(),
+            Err(e) => error!("Build failed: {e}"),
+        }
+    })
+    .await;
 }
 
 async fn exec_doctor(root: Option<PathBuf>) {
-    let Some((ctx, db)) = load_project_context(root).await else {
-        return;
-    };
-    let outcome = doctor::run(&db, &ctx).await;
-    outcome.emit();
-    if !outcome.has_errors() && !outcome.has_warnings() {
-        info!("Doctor check complete; no issues found");
-    }
+    run_with_context(root, "Doctor", |ctx, db| async move {
+        let outcome = doctor::run(&db, &ctx).await;
+        outcome.emit();
+        if !outcome.has_errors() && !outcome.has_warnings() {
+            info!("Doctor check complete; no issues found");
+        }
+    })
+    .await;
 }
 
 async fn exec_deploy(root: Option<PathBuf>, raw: String) {
+    let dry_run = raw.split_whitespace().any(|w| w == "--dry-run");
+    run_with_context(root, "Deploy", |ctx, db| async move {
+        match deploy::deploy(&db, &ctx, dry_run).await {
+            Ok(msg) => info!("{msg}"),
+            Err(e) => error!("Deploy failed: {e}"),
+        }
+    })
+    .await;
+}
+
+async fn run_with_context<F, Fut>(root: Option<PathBuf>, name: &str, run: F)
+where
+    F: FnOnce(ProjectContext, DbManager) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let Some((ctx, db)) = load_project_context(root).await else {
+        error!("{name} failed: no project selected");
         return;
     };
-    let dry_run = raw.split_whitespace().any(|w| w == "--dry-run");
-    match deploy::deploy(&db, &ctx, dry_run).await {
-        Ok(msg) => info!("{msg}"),
-        Err(e) => error!("Deploy failed: {e}"),
-    }
+    run(ctx, db).await;
 }
 
 async fn exec_rollback(root: Option<PathBuf>, raw: String) {

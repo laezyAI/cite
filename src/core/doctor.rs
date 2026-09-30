@@ -1,5 +1,4 @@
-//! `cite doctor`: validation that fails a deploy (errors) and content-quality
-//! lints (warnings), checked locally before anything reaches Supabase.
+//! `cite doctor`: deploy-blocking validation plus content-quality lints, all checked locally (ready when `errors` is empty).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -19,7 +18,6 @@ use crate::core::metadata::{
 };
 use crate::core::project::ProjectContext;
 
-/// Everything doctor found; the project is ready to deploy when `errors` is empty.
 #[derive(Debug, Default, Serialize)]
 pub struct DoctorOutcome {
     pub errors: Vec<String>,
@@ -55,7 +53,6 @@ impl DoctorOutcome {
     }
 }
 
-/// The full report: project setup, validation, content lints and local history.
 pub async fn run(db: &DbManager, ctx: &ProjectContext) -> DoctorOutcome {
     let mut out = DoctorOutcome::default();
     check_project(ctx, &mut out);
@@ -65,8 +62,6 @@ pub async fn run(db: &DbManager, ctx: &ProjectContext) -> DoctorOutcome {
     out
 }
 
-/// Only the checks whose failure would break or corrupt a deploy; `deploy` runs
-/// these before writing anything.
 pub fn validate(ctx: &ProjectContext) -> DoctorOutcome {
     let mut out = DoctorOutcome::default();
     validate_into(ctx, &mut out);
@@ -82,8 +77,6 @@ fn validate_into(ctx: &ProjectContext, out: &mut DoctorOutcome) {
         check_bibtex(ctx, pod, out);
     }
 }
-
-// ── Validation: problems that fail or corrupt a deploy ──
 
 fn check_project(ctx: &ProjectContext, out: &mut DoctorOutcome) {
     let project = &ctx.manifest.project;
@@ -234,8 +227,6 @@ fn check_timeline(ctx: &ProjectContext, pod: &Podcast, out: &mut DoctorOutcome) 
     }
 }
 
-/// An inline or BibTeX event: a title within the column limit, a date the app can
-/// show, and a link it can open.
 fn check_event(context: &str, event: &TimelineEntry, out: &mut DoctorOutcome) {
     check_title(context, &event.title, out);
     let label = format!("{context} '{}'", event.title.trim());
@@ -331,7 +322,6 @@ fn check_image(ctx: &ProjectContext, pod: &Podcast, out: &mut DoctorOutcome) {
     }
 }
 
-/// Extension and size limits of the storage bucket an asset is uploaded to.
 fn check_asset(
     title: &str,
     kind: &str,
@@ -386,7 +376,6 @@ fn check_bibtex(ctx: &ProjectContext, pod: &Podcast, out: &mut DoctorOutcome) {
     }
 }
 
-/// Contents of a project file that exists; a missing file is reported elsewhere.
 fn read_existing(
     ctx: &ProjectContext,
     file: &str,
@@ -406,7 +395,6 @@ fn read_existing(
         .ok()
 }
 
-/// An `http(s)://` link with a host and no spaces, which the app can open.
 fn is_web_url(url: &str) -> bool {
     let host = url
         .strip_prefix("https://")
@@ -415,10 +403,6 @@ fn is_web_url(url: &str) -> bool {
     host.is_some_and(|h| !h.is_empty()) && !url.contains(char::is_whitespace)
 }
 
-// ── Local history ──
-
-/// Build and deploy history from the local database; the latest deployment id is
-/// what `cite rollback` takes.
 async fn history(db: &DbManager, ctx: &ProjectContext, out: &mut DoctorOutcome) {
     let project_id = ctx.project_id();
     if let Ok(stats) = db.get_project_stats(&project_id).await
@@ -440,8 +424,6 @@ async fn history(db: &DbManager, ctx: &ProjectContext, out: &mut DoctorOutcome) 
         ));
     }
 }
-
-// ── Lints: content quality, never blocking ──
 
 fn lint(ctx: &ProjectContext, out: &mut DoctorOutcome) {
     let mut contents = Vec::new();
@@ -574,7 +556,6 @@ fn lint_image(name: &str, meta: &crate::core::media::ImageMeta, out: &mut Doctor
     }
 }
 
-/// Paragraphs that appear in more than one episode.
 fn lint_duplicate_paragraphs(contents: &[(&str, String)], out: &mut DoctorOutcome) {
     let mut first_seen: HashMap<&str, usize> = HashMap::new();
     for (idx, (title, content)) in contents.iter().enumerate() {
@@ -601,7 +582,6 @@ fn lint_duplicate_paragraphs(contents: &[(&str, String)], out: &mut DoctorOutcom
     }
 }
 
-/// The most common value, when there are at least two to compare.
 fn majority<'a, T: Eq + Hash + 'a>(values: impl Iterator<Item = &'a T>) -> Option<&'a T> {
     let mut counts: HashMap<&T, usize> = HashMap::new();
     for value in values {

@@ -1,3 +1,4 @@
+//! Deterministic build of sources into `build/content.json` with an incremental hash cache (local analytics writes are best-effort).
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -129,7 +130,6 @@ pub async fn compile(
         .map(|t| t.entries.len() as i64)
         .sum();
 
-    // Local analytics are best-effort: a DB hiccup must not fail an otherwise good build.
     let _ = db.save_cache(&project_id, &current_hashes).await;
     let _ = db.sync_project(ctx, &bundle).await;
     let _ = db
@@ -156,8 +156,6 @@ pub async fn compile(
     })
 }
 
-/// A local id derived from what the author wrote, so the same episode or citation
-/// file always gets the same id without keeping an id cache on disk.
 fn stable_id(project_id: &str, kind: &str, file: &str) -> String {
     let key = format!("cite:{project_id}:{kind}:{file}");
     Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
@@ -227,7 +225,6 @@ async fn build_bundle(ctx: &ProjectContext, project_id: &str) -> Result<ContentB
     })
 }
 
-/// Read a UTF-8 file if `enabled` and it exists; a missing file is not an error.
 async fn read_optional(path: &Path, enabled: bool) -> Result<Option<String>, CiteError> {
     if !enabled || !path.is_file() {
         return Ok(None);
@@ -289,7 +286,6 @@ mod tests {
             "no cache yet, so this is a full build"
         );
 
-        // Duplicate BibTeX titles must not collide in the local snapshot.
         let snapshot = db.get_restore_snapshot(&ctx.project_id()).await.unwrap();
         assert_eq!(snapshot.podcasts.len(), 1);
         assert_eq!(snapshot.timelines.len(), 2);

@@ -1,3 +1,4 @@
+//! `cite.toml` shape: project identity, build settings, and the Supabase backend (accepts legacy `staging_*` keys).
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,14 +37,11 @@ impl Default for BuildConfig {
     }
 }
 
-/// The Supabase project a deploy writes to. The `staging_*` names are accepted
-/// for manifests written before they were renamed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct BackendConfig {
     #[serde(alias = "staging_url")]
     pub url: Option<String>,
-    /// Project API key: the anon key (with `cite login`) or the service role key.
     #[serde(alias = "staging_service_key")]
     pub api_key: Option<String>,
 }

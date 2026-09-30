@@ -1,4 +1,4 @@
-//! Access to Supabase: stored credentials, the login session, and authenticated connections.
+//! Supabase access: stored credentials, login session with auto-refresh, and authenticated connections.
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -14,18 +14,13 @@ use crate::core::manifest::BackendConfig;
 use crate::core::project::ProjectContext;
 use crate::core::supabase::{Row, Supabase, row};
 
-/// Refresh access tokens this many seconds before they expire.
 const TOKEN_EXPIRY_MARGIN_SECS: i64 = 60;
 
-/// An authenticated client for a project's backend.
 pub struct Connection {
     pub api: Supabase,
-    /// Logged-in user id; `None` when authenticating with the configured key alone.
     pub user_id: Option<String>,
 }
 
-/// Connects to the project's backend as the logged-in user (refreshing an expired
-/// session), falling back to the configured key when there is no session.
 pub async fn connect(ctx: &ProjectContext) -> Result<Connection, CiteError> {
     let backend = resolve_backend(ctx.manifest.backend.as_ref())?;
     let client = reqwest::Client::new();
@@ -39,12 +34,9 @@ pub async fn connect(ctx: &ProjectContext) -> Result<Connection, CiteError> {
     })
 }
 
-/// The Supabase project URL deploys go to, resolved without contacting it.
 pub fn backend_url(ctx: &ProjectContext) -> Result<String, CiteError> {
     Ok(base_url(&resolve_backend(ctx.manifest.backend.as_ref())?).to_string())
 }
-
-// ── Credentials ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SupabaseCredentials {
@@ -63,8 +55,6 @@ fn creds_path() -> PathBuf {
         .unwrap_or_else(|| crate::core::cite_home().join("credentials.toml"))
 }
 
-/// Supabase URL and API key from `CITE_SUPABASE_URL`/`CITE_SUPABASE_API_KEY`,
-/// or `~/.cite/credentials.toml` (written by `cite login`).
 fn load_credentials() -> Result<SupabaseCredentials, CiteError> {
     if let (Ok(url), Ok(key)) = (
         std::env::var("CITE_SUPABASE_URL"),
@@ -100,7 +90,6 @@ fn save_credentials(creds: &SupabaseCredentials) -> Result<(), CiteError> {
     Ok(())
 }
 
-/// The project's `[backend]` from cite.toml, else the stored credentials.
 fn resolve_backend(project_backend: Option<&BackendConfig>) -> Result<BackendConfig, CiteError> {
     if let Some(backend) = project_backend {
         return Ok(backend.clone());
@@ -119,8 +108,6 @@ fn base_url(backend: &BackendConfig) -> &str {
         .unwrap_or_default()
         .trim_end_matches('/')
 }
-
-// ── Session ──
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -141,9 +128,7 @@ struct Session {
     refresh_token: String,
     email: String,
     user_id: String,
-    /// Unix seconds when `access_token` expires.
     expires_at: i64,
-    /// Supabase project URL the tokens were issued by.
     url: String,
 }
 
@@ -200,8 +185,6 @@ async fn request_token(
     serde_json::from_str(&body).map_err(|e| CiteError::Auth(format!("Invalid token response: {e}")))
 }
 
-/// The saved login for this Supabase project, refreshed first if its access token expired.
-/// Sessions issued by a different project are ignored.
 async fn active_session(
     client: &reqwest::Client,
     base_url: &str,
@@ -237,8 +220,6 @@ fn resolve_bearer(backend: &BackendConfig, session: Option<&Session>) -> Result<
     }
 }
 
-/// Signs in to the same Supabase project `deploy` connects to, so the saved
-/// session is the one deploys use.
 pub async fn login(
     project_backend: Option<BackendConfig>,
     email: Option<String>,
@@ -297,8 +278,6 @@ pub async fn login(
     Ok(())
 }
 
-/// `(id, name)` of the artists owned by `user_id`. Artists are publicly readable,
-/// so the owner filter is what scopes this to the account.
 async fn fetch_user_artists(
     api: &Supabase,
     user_id: &str,
@@ -317,7 +296,6 @@ async fn fetch_user_artists(
         .collect())
 }
 
-/// Creates an artist owned by the logged-in user `user_id`.
 async fn prompt_create_artist(
     api: &Supabase,
     user_id: &str,
@@ -335,8 +313,6 @@ async fn prompt_create_artist(
     Ok(Some((id, name)))
 }
 
-/// An `artists` row owned by `user_id`, as the `artists_insert_own` policy requires.
-/// Empty optional values are left out and a scheme-less website gets `https://`.
 fn artist_row(name: &str, user_id: &str, description: &str, website: &str) -> Row {
     let mut payload = row([
         ("name", Value::from(name)),
@@ -364,8 +340,6 @@ fn prompt_line(label: &str) -> Result<String, CiteError> {
     Ok(s.trim().to_string())
 }
 
-/// Like `prompt_line`, but typed characters are not echoed. Falls back to a plain
-/// read when stdin is not a terminal (e.g. piped input).
 fn prompt_secret(label: &str) -> Result<String, CiteError> {
     if !std::io::stdin().is_terminal() {
         return prompt_line(label);
@@ -495,7 +469,6 @@ mod credentials_tests {
     use std::env;
     use std::sync::{Mutex, MutexGuard};
 
-    /// Tests in this module mutate process-wide env vars; run them one at a time.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_lock() -> MutexGuard<'static, ()> {

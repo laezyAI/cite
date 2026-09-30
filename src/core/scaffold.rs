@@ -1,5 +1,4 @@
-//! Creating project directories: new projects (`cite init`) and archived ones
-//! restored from the local database.
+//! Project scaffolding: new projects from `cite init` and restores from the local snapshot (assets are re-added by hand).
 
 use std::collections::HashMap;
 use std::fs;
@@ -66,16 +65,12 @@ pub fn init_project(name: &str, root: &Path) -> Result<(), CiteError> {
     Ok(())
 }
 
-/// What `restore_project` recreated, plus assets the author has to add back.
 pub struct RestoreSummary {
     pub podcasts: usize,
     pub timeline_events: usize,
     pub warnings: Vec<String>,
 }
 
-/// Recreates an archived project at `target` from its last build snapshot in the
-/// local database: cite.toml, the metadata file, Markdown content, and BibTeX files.
-/// Audio and image assets are not stored locally and are reported as warnings.
 pub async fn restore_project(
     db: &DbManager,
     project_id: &str,
@@ -119,7 +114,6 @@ pub async fn restore_project(
             let bib = bibtex::render(entries.unwrap_or_default());
             write_file(&target.join(citation), &bib)?;
         }
-        // Snapshots from older versions kept only the fields below and the citation file.
         podcasts.push(pod.metadata.clone().unwrap_or_else(|| {
             Podcast {
                 title: pod.title.clone(),

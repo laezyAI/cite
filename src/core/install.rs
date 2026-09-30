@@ -1,4 +1,4 @@
-//! Managing the installed `cite` binary: self-update and uninstall.
+//! Installed binary management: self-update from releases and uninstall (lists all versions since the API skips prereleases).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,11 +11,6 @@ use crate::core::CiteError;
 const REPO: &str = "laezyAI/cite";
 const BIN_NAME: &str = "cite";
 
-/// A parsed `major.minor.patch[-pre]` version with semver precedence.
-///
-/// Field order drives the derived ordering: a release (`is_release = true`) sorts after
-/// any prerelease of the same core version, and prerelease identifiers compare
-/// numerically when numeric and lexically otherwise (numeric < alphanumeric).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Version {
     core: (u64, u64, u64),
@@ -82,7 +77,6 @@ struct Release {
     draft: bool,
 }
 
-/// Self-update by running the cargo-dist installer published with the newest release.
 pub async fn upgrade() -> Result<String, CiteError> {
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .ok_or_else(|| CiteError::Config("Invalid package version".into()))?;
@@ -92,7 +86,6 @@ pub async fn upgrade() -> Result<String, CiteError> {
         .user_agent(concat!("cite/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    // `/releases/latest` skips prereleases, so pick the highest version from the list instead.
     let releases: Vec<Release> = client
         .get(format!(
             "https://api.github.com/repos/{REPO}/releases?per_page=30"
@@ -161,7 +154,6 @@ fn installer_command() -> (&'static str, &'static str, &'static [&'static str]) 
 }
 
 fn run_installer(script: &Path, interpreter: &str, args: &[&str]) -> Result<(), CiteError> {
-    // Windows cannot overwrite a running executable, but it can rename it out of the way.
     let parked = park_running_exe()?;
 
     let status = std::process::Command::new(interpreter)
